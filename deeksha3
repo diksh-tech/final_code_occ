@@ -1,0 +1,553 @@
+# ag_ui_adapter.py
+import os
+import json
+import asyncio
+import time
+import uuid
+from typing import AsyncGenerator, List
+
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+
+from client import FlightOpsMCPClient
+
+app = FastAPI(title="FlightOps — AG-UI Adapter")
+
+# CORS (adjust origins for your Vite origin)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],           # lock down in prod
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+mcp_client = FlightOpsMCPClient()
+
+
+def sse_event(data: dict) -> str:
+    """Encode one SSE event (JSON payload)"""
+    return f"data: {json.dumps(data, default=str, ensure_ascii=False)}\n\n"
+
+
+async def ensure_mcp_connected():
+    if not mcp_client.session:
+        await mcp_client.connect()
+
+
+@app.on_event("startup")
+async def startup_event():
+    try:
+        await ensure_mcp_connected()
+    except Exception:
+        # don't crash; /health will reflect status
+        pass
+
+
+@app.get("/")
+async def root():
+    return {"message": "FlightOps AG-UI Adapter running", "status": "ok"}
+
+
+@app.get("/health")
+async def health():
+    try:
+        await ensure_mcp_connected()
+        return {"status": "healthy", "mcp_connected": True}
+    except Exception as e:
+        return {"status": "unhealthy", "mcp_connected": False, "error": str(e)}
+
+
+def chunk_text(txt: str, max_len: int = 200) -> List[str]:
+    """
+    Split text into small chunks for streaming as typing.
+    Prefer sentence boundaries; fallback by length.
+    """
+    txt = txt or ""
+    parts: List[str] = []
+    buf = ""
+
+    def flush():
+        nonlocal buf
+        if buf:
+            parts.append(buf)
+            buf = ""
+
+    for ch in txt:
+        buf += ch
+        # flush at sentence end or when too long
+        if ch in ".!?\n" and len(buf) >= max_len // 2:
+            flush()
+        elif len(buf) >= max_len:
+            flush()
+    flush()
+    return parts
+
+
+@app.post("/agent", response_class=StreamingResponse)
+async def run_agent(request: Request):
+    """
+    AG-UI compatible streaming endpoint (SSE).
+    Expected body:
+      {
+        thread_id?, run_id?,
+        messages: [{role, content}, ...],
+        tools?: []
+      }
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    thread_id = body.get("thread_id") or f"thread-{uuid.uuid4().hex[:8]}"
+    run_id = body.get("run_id") or f"run-{uuid.uuid4().hex[:8]}"
+    messages = body.get("messages", [])
+
+    # last user message as query
+    user_query = ""
+    if messages:
+        last = messages[-1]
+        if isinstance(last, dict) and last.get("role") == "user":
+            user_query = last.get("content", "") or ""
+        elif isinstance(last, str):
+            user_query = last
+
+    if not user_query.strip():
+        raise HTTPException(status_code=400, detail="No user query found")
+
+    async def event_stream() -> AsyncGenerator[str, None]:
+        last_heartbeat = time.time()
+
+        # --- RUN STARTED
+        yield sse_event({"type": "RUN_STARTED", "thread_id": thread_id, "run_id": run_id})
+        yield sse_event({"type": "STATE_UPDATE", "state": {"phase": "planning", "progress_pct": 5}})
+
+        # ensure MCP
+        try:
+            await ensure_mcp_connected()
+        except Exception as e:
+            yield sse_event({"type": "RUN_ERROR", "error": f"MCP connect failed: {e}"})
+            return
+
+        loop = asyncio.get_event_loop()
+
+        # --- PLAN
+        yield sse_event({"type": "TEXT_MESSAGE_CONTENT", "content": "Generating tool plan...\n"})
+        try:
+            plan_data = await loop.run_in_executor(None, mcp_client.plan_tools, user_query)
+        except Exception as e:
+            yield sse_event({"type": "RUN_ERROR", "error": f"Planner error: {e}"})
+            return
+
+        plan = plan_data.get("plan", []) if isinstance(plan_data, dict) else []
+        yield sse_event({"type": "STATE_SNAPSHOT", "snapshot": {"plan": plan}})
+
+        if not plan:
+            yield sse_event({"type": "TEXT_MESSAGE_CONTENT", "content": "No valid plan produced.\n"})
+            yield sse_event({"type": "STATE_UPDATE", "state": {"phase": "finished", "progress_pct": 100}})
+            yield sse_event({"type": "RUN_FINISHED", "run_id": run_id})
+            return
+
+        # progress budgeting
+        # planning: 5→15, tools: 15→85, summary: 85→100
+        yield sse_event({"type": "STATE_UPDATE", "state": {"phase": "running tools", "progress_pct": 15}})
+
+        # --- Execute tools
+        results = []
+        num_steps = max(1, len(plan))
+        # Each step roughly moves progress within 15-85 → 70% window
+        per_step = 70.0 / num_steps
+        current_progress = 15.0
+
+        for step_index, step in enumerate(plan):
+            if await request.is_disconnected():
+                return
+
+            tool_name = step.get("tool")
+            args = step.get("arguments", {}) or {}
+
+            tool_call_id = f"toolcall-{uuid.uuid4().hex[:8]}"
+            yield sse_event({
+                "type": "TOOL_CALL_START",
+                "toolCallId": tool_call_id,
+                "toolCallName": tool_name,
+                "parentMessageId": None
+            })
+
+            # args
+            yield sse_event({
+                "type": "TOOL_CALL_ARGS",
+                "toolCallId": tool_call_id,
+                "delta": json.dumps(args, ensure_ascii=False)
+            })
+            yield sse_event({"type": "TOOL_CALL_END", "toolCallId": tool_call_id})
+
+            # call tool
+            try:
+                tool_result = await mcp_client.invoke_tool(tool_name, args)
+            except Exception as exc:
+                tool_result = {"error": str(exc)}
+
+            # result
+            yield sse_event({
+                "type": "TOOL_CALL_RESULT",
+                "message": {
+                    "id": f"msg-{uuid.uuid4().hex[:8]}",
+                    "role": "tool",
+                    "content": json.dumps(tool_result, ensure_ascii=False),
+                    "tool_call_id": tool_call_id,
+                }
+            })
+            results.append({tool_name: tool_result})
+
+            yield sse_event({
+                "type": "STEP_FINISHED",
+                "step_index": step_index,
+                "tool": tool_name
+            })
+
+            # update progress
+            current_progress = min(85.0, 15.0 + per_step * (step_index + 1))
+            yield sse_event({"type": "STATE_UPDATE", "state": {"phase": "running tools", "progress_pct": round(current_progress, 2)}})
+
+            # heartbeat every ~15s while long tools run
+            if time.time() - last_heartbeat > 15:
+                yield sse_event({"type": "HEARTBEAT", "ts": time.time()})
+                last_heartbeat = time.time()
+
+        # --- SUMMARY
+        yield sse_event({"type": "STATE_UPDATE", "state": {"phase": "summarizing", "progress_pct": 90}})
+        yield sse_event({"type": "TEXT_MESSAGE_CONTENT", "content": "Summarizing results...\n"})
+
+        try:
+            summary_obj = await loop.run_in_executor(None, mcp_client.summarize_results, user_query, plan, results)
+            # summarize_results returns {"summary": "..."}
+            assistant_text = summary_obj.get("summary", "") if isinstance(summary_obj, dict) else str(summary_obj)
+        except Exception as e:
+            assistant_text = f"Failed to summarize results: {e}"
+
+        # stream summary as chunks (typing)
+        msg_id = f"msg-{uuid.uuid4().hex[:8]}"
+        for chunk in chunk_text(assistant_text, max_len=220):
+            yield sse_event({
+                "type": "TEXT_MESSAGE_CONTENT",
+                "message": {
+                    "id": msg_id,
+                    "role": "assistant",
+                    "delta": chunk
+                }
+            })
+            await asyncio.sleep(0.02)  # small delay for UX
+
+        yield sse_event({"type": "STATE_SNAPSHOT", "snapshot": {"plan": plan, "results": results}})
+        yield sse_event({"type": "STATE_UPDATE", "state": {"phase": "finished", "progress_pct": 100}})
+        yield sse_event({"type": "RUN_FINISHED", "run_id": run_id})
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+####################################################3
+  import React, { useState, useRef, useEffect } from "react";
+import MessageBubble from "./MessageBubble";
+
+const AG_AGENT_ENDPOINT = import.meta.env.VITE_AGENT_ENDPOINT || "http://localhost:8001/agent";
+
+export default function ChatPage() {
+  const [messages, setMessages] = useState([
+    {
+      role: "assistant",
+      content: "Hello! 👋 I'm your FlightOps Agent. Ask me anything about flight operations — delays, fuel, passengers, aircraft details, etc.",
+      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    },
+  ]);
+  const [input, setInput] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  // NEW: state for thinking/progress + streaming typing
+  const [phase, setPhase] = useState("");            // planning | running tools | summarizing | finished
+  const [progress, setProgress] = useState(0);       // 0..100
+  const streamingMsgIdRef = useRef(null);            // the assistant message currently being "typed"
+  const messagesEndRef = useRef(null);
+
+  const scrollToBottom = () => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  };
+
+  useEffect(() => {
+    scrollToBottom();
+  }, [messages]);
+
+  async function sendMessage() {
+    if (!input.trim()) return;
+
+    const userMessage = { 
+      role: "user", 
+      content: input,
+      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    };
+    setMessages((prev) => [...prev, userMessage]);
+    setLoading(true);
+    setInput("");
+
+    // reset state for a new run
+    setPhase("planning");
+    setProgress(5);
+    streamingMsgIdRef.current = null;
+
+    const body = {
+      thread_id: "thread-" + Date.now(),
+      run_id: "run-" + Date.now(),
+      messages: [userMessage],
+    };
+
+    try {
+      const resp = await fetch(AG_AGENT_ENDPOINT, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+
+      if (!resp.ok) {
+        const errTxt = await resp.text();
+        throw new Error(errTxt);
+      }
+
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+
+        let idx;
+        while ((idx = buf.indexOf("\n\n")) !== -1) {
+          const chunk = buf.slice(0, idx).trim();
+          buf = buf.slice(idx + 2);
+          const lines = chunk.split("\n");
+
+          for (const line of lines) {
+            if (line.startsWith("data: ")) {
+              const payload = line.slice(6).trim();
+              if (!payload) continue;
+
+              try {
+                const event = JSON.parse(payload);
+                handleEvent(event);
+              } catch (err) {
+                console.warn("Bad SSE line:", payload);
+              }
+            }
+          }
+        }
+      }
+    } catch (err) {
+      setMessages((prev) => [
+        ...prev,
+        { 
+          role: "assistant", 
+          content: "⚠️ Error: " + err.message,
+          timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+        },
+      ]);
+    } finally {
+      setLoading(false);
+      // phase/progress will be finalized by RUN_FINISHED, but if not received:
+      // setPhase("finished"); setProgress(100);
+    }
+  }
+
+  function handleEvent(event) {
+    const timestamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+    switch (event.type) {
+      // NEW: live state → show thinking/progress
+      case "STATE_UPDATE": {
+        const st = event.state || {};
+        if (typeof st.phase === "string") setPhase(st.phase);
+        if (typeof st.progress_pct === "number") setProgress(Math.max(0, Math.min(100, st.progress_pct)));
+        break;
+      }
+
+      case "TEXT_MESSAGE_CONTENT": {
+        // Two possibilities in our adapter:
+        // 1) status text via { content: "Generating tool plan..." }  (non-streaming)
+        // 2) streaming assistant via { message: { id, role, delta } }
+        if (event.message?.delta) {
+          const { id, delta } = event.message;
+
+          // if this is first chunk, create an assistant bubble and remember id
+          if (!streamingMsgIdRef.current || streamingMsgIdRef.current !== id) {
+            streamingMsgIdRef.current = id;
+            setMessages(prev => [
+              ...prev,
+              { role: "assistant", content: delta, timestamp }
+            ]);
+          } else {
+            // append delta to the last assistant bubble
+            setMessages(prev => {
+              if (prev.length === 0) return prev;
+              const last = prev[prev.length - 1];
+              if (last.role !== "assistant") {
+                // if somehow last isn't assistant, push a new one
+                return [...prev, { role: "assistant", content: delta, timestamp }];
+              }
+              const updated = { ...last, content: (last.content || "") + delta };
+              const next = prev.slice(0, -1).concat(updated);
+              return next;
+            });
+          }
+        } else if (event.message?.content) {
+          // final, non-streamed assistant content (fallback)
+          setMessages((prev) => [
+            ...prev,
+            { 
+              role: "assistant", 
+              content: event.message.content,
+              timestamp
+            },
+          ]);
+        } else if (event.content) {
+          // small status note (optional to show)
+          setMessages((prev) => [
+            ...prev,
+            { 
+              role: "assistant", 
+              content: event.content,
+              timestamp
+            },
+          ]);
+        }
+        break;
+      }
+
+      case "TOOL_CALL_RESULT":
+        // ignore tool raw dumps in chat (you can show in a side panel if needed)
+        break;
+
+      case "RUN_FINISHED":
+        // finish progress + reset streaming pointer
+        setPhase("finished");
+        setProgress(100);
+        streamingMsgIdRef.current = null;
+        break;
+
+      default:
+        // ignore other technical events (HEARTBEAT, STATE_SNAPSHOT, etc.)
+        break;
+    }
+  }
+
+  return (
+    <div className="chat-container">
+      {/* NEW: top thin progress / phase bar (non-intrusive) */}
+      {(loading || phase) && (
+        <div className="statebar">
+          <div className="statebar-left">
+            <span className="state-dot" />
+            <span className="state-text">
+              {phase ? phase : "thinking..."}
+            </span>
+          </div>
+          <div className="statebar-progress">
+            <div className="statebar-progress-fill" style={{ width: `${progress}%` }} />
+          </div>
+        </div>
+      )}
+
+      <div className="messages-container">
+        {messages.map((msg, idx) => (
+          <MessageBubble 
+            key={idx} 
+            role={msg.role} 
+            content={msg.content} 
+            timestamp={msg.timestamp}
+          />
+        ))}
+
+        {/* Old 3-dot loader stays for "general thinking" before streaming starts */}
+        {loading && (
+          <div className="loading-message">
+            <div className="loading-dots">
+              <span></span>
+              <span></span>
+              <span></span>
+            </div>
+            <div className="loading-timestamp">
+              {new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+            </div>
+          </div>
+        )}
+        <div ref={messagesEndRef} />
+      </div>
+
+      <div className="input-container">
+        <input
+          type="text"
+          className="message-input"
+          placeholder="Ask about a flight, e.g. 'Why was 6E215 delayed on June 23, 2024?'"
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && sendMessage()}
+        />
+        <button
+          onClick={sendMessage}
+          className="send-button"
+          disabled={loading}
+        >
+          Send
+        </button>
+      </div>
+    </div>
+  );
+}
+##########################################
+  /* ====== State / Progress Bar (thinking / processing) ====== */
+.statebar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  border-bottom: 1px solid #e5e7eb;
+  background: #fff;
+}
+
+.statebar-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 160px;
+}
+
+.state-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: #10b981; /* green-ish */
+  box-shadow: 0 0 0 2px rgba(16,185,129,0.15);
+}
+
+.state-text {
+  font-size: 0.9rem;
+  color: #374151;
+  text-transform: capitalize;
+}
+
+.statebar-progress {
+  flex: 1;
+  height: 6px;
+  background: #f3f4f6;
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.statebar-progress-fill {
+  height: 100%;
+  width: 0%;
+  background: linear-gradient(90deg, #4f46e5, #7c3aed);
+  border-radius: 999px;
+  transition: width 180ms ease;
+}
+######################################
+  
