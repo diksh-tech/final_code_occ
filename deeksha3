@@ -1,3 +1,64 @@
+function handleEvent(event) {
+  const timestamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+  switch (event.type) {
+    case "STATE_UPDATE": {
+      const st = event.state || {};
+      if (typeof st.phase === "string") setPhase(st.phase);
+      if (typeof st.progress_pct === "number") setProgress(Math.max(0, Math.min(100, st.progress_pct)));
+      break;
+    }
+
+    case "TEXT_MESSAGE_CONTENT": {
+      // ✅ Show ONLY streamed deltas or final assistant content.
+      if (event.message?.delta) {
+        const { id, delta } = event.message;
+
+        if (!streamingMsgIdRef.current || streamingMsgIdRef.current !== id) {
+          streamingMsgIdRef.current = id;
+          setMessages(prev => [
+            ...prev,
+            { role: "assistant", content: delta, timestamp }
+          ]);
+        } else {
+          setMessages(prev => {
+            if (prev.length === 0) return prev;
+            const last = prev[prev.length - 1];
+            if (last.role !== "assistant") {
+              return [...prev, { role: "assistant", content: delta, timestamp }];
+            }
+            const updated = { ...last, content: (last.content || "") + delta };
+            return prev.slice(0, -1).concat(updated);
+          });
+        }
+      } else if (event.message?.content) {
+        // Final (non-streamed) assistant text
+        setMessages(prev => [
+          ...prev,
+          { role: "assistant", content: event.message.content, timestamp }
+        ]);
+      }
+      // ❌ IGNORE plain status text like "Generating tool plan..." / "Summarizing results..."
+      // else if (event.content) { /* do nothing */ }
+      break;
+    }
+
+    case "TOOL_CALL_RESULT":
+      // ignore raw tool results in chat
+      break;
+
+    case "RUN_FINISHED":
+      setPhase("finished");
+      setProgress(100);
+      streamingMsgIdRef.current = null;
+      break;
+
+    default:
+      break;
+  }
+}
+########################################
+
 # ag_ui_adapter.py
 import os
 import json
