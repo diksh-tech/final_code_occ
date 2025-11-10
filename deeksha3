@@ -1,3 +1,324 @@
+import React, { useState, useRef, useEffect } from "react";
+import MessageBubble from "./MessageBubble";
+
+const AG_AGENT_ENDPOINT =
+  import.meta.env.VITE_AGENT_ENDPOINT || "http://localhost:8001/agent";
+
+export default function ChatPage() {
+  const [messages, setMessages] = useState([
+    {
+      role: "assistant",
+      content:
+        "Hello! 👋 I'm your FlightOps Agent. Ask me anything about flight operations — delays, fuel, passengers, aircraft details, etc.",
+      timestamp: new Date().toLocaleTimeString([], {
+        hour: "2-digit",
+        minute: "2-digit",
+      }),
+    },
+  ]);
+
+  const [input, setInput] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  // Optional: keep a simple phase/progress if you’re showing a header bar elsewhere
+  const [phase, setPhase] = useState("idle"); // idle | planning | running_tools | summarizing | finished
+  const [progress, setProgress] = useState(0);
+
+  // track currently streaming assistant message id (for delta concatenation)
+  const streamingMsgIdRef = useRef(null);
+
+  const messagesEndRef = useRef(null);
+  const abortRef = useRef(null);
+
+  const scrollToBottom = () => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  };
+
+  useEffect(() => {
+    scrollToBottom();
+  }, [messages]);
+
+  async function sendMessage() {
+    if (!input.trim()) return;
+
+    // add user message to chat
+    const userMessage = {
+      role: "user",
+      content: input,
+      timestamp: new Date().toLocaleTimeString([], {
+        hour: "2-digit",
+        minute: "2-digit",
+      }),
+    };
+    setMessages((prev) => [...prev, userMessage]);
+
+    // reset input & UI state
+    setInput("");
+    setLoading(true);
+    setPhase("planning");
+    setProgress(5);
+    streamingMsgIdRef.current = null;
+
+    // build AG-UI compatible payload
+    const body = {
+      thread_id: "thread-" + Date.now(),
+      run_id: "run-" + Date.now(),
+      messages: [{ role: "user", content: userMessage.content }],
+      tools: [],
+    };
+
+    // prepare abort controller so we can cancel mid-run if needed
+    abortRef.current = new AbortController();
+
+    try {
+      const resp = await fetch(AG_AGENT_ENDPOINT, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal: abortRef.current.signal,
+      });
+
+      if (!resp.ok) {
+        const errTxt = await resp.text();
+        throw new Error(errTxt || "Request failed");
+      }
+
+      // read the SSE stream
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buf += decoder.decode(value, { stream: true });
+
+        // split by double-newline (one SSE event)
+        let idx;
+        while ((idx = buf.indexOf("\n\n")) !== -1) {
+          const chunk = buf.slice(0, idx).trim();
+          buf = buf.slice(idx + 2);
+
+          const lines = chunk.split("\n");
+          for (const line of lines) {
+            if (!line.startsWith("data: ")) continue;
+
+            const payload = line.slice(6).trim();
+            if (!payload) continue;
+
+            try {
+              const event = JSON.parse(payload);
+              handleEvent(event);
+            } catch (e) {
+              console.warn("Bad SSE data:", payload);
+            }
+          }
+        }
+      }
+    } catch (err) {
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: "assistant",
+          content: "⚠️ Error: " + (err?.message || "Unknown error"),
+          timestamp: new Date().toLocaleTimeString([], {
+            hour: "2-digit",
+            minute: "2-digit",
+          }),
+        },
+      ]);
+    } finally {
+      setLoading(false);
+      abortRef.current = null;
+    }
+  }
+
+  // ✅ Updated: ignore plain status text; only render assistant deltas/final content.
+  function handleEvent(event) {
+    const timestamp = new Date().toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+
+    switch (event.type) {
+      case "RUN_STARTED": {
+        setPhase("planning");
+        setProgress(10);
+        break;
+      }
+
+      case "STATE_SNAPSHOT": {
+        // Optional: you can inspect plan/results here if needed.
+        break;
+      }
+
+      case "STATE_UPDATE": {
+        // If adapter ever sends these, update phase/progress safely
+        const st = event.state || {};
+        if (typeof st.phase === "string") setPhase(st.phase);
+        if (typeof st.progress_pct === "number")
+          setProgress(Math.max(0, Math.min(100, st.progress_pct)));
+        break;
+      }
+
+      case "TOOL_CALL_START": {
+        setPhase("running_tools");
+        setProgress((p) => Math.max(p, 30));
+        break;
+      }
+
+      case "TOOL_CALL_RESULT": {
+        // Intentionally not rendering tool result messages in chat.
+        setProgress((p) => Math.min(90, p + 10));
+        break;
+      }
+
+      case "TEXT_MESSAGE_CONTENT": {
+        // Two possible shapes:
+        // 1) event.message.delta → stream chunk-by-chunk
+        // 2) event.message.content → final whole text
+        // We IGNORE event.content (plain status like "Generating tool plan...")
+        if (event.message?.delta) {
+          const { id, delta } = event.message;
+
+          // first delta for this message id → create new assistant bubble
+          if (!streamingMsgIdRef.current || streamingMsgIdRef.current !== id) {
+            streamingMsgIdRef.current = id;
+            setMessages((prev) => [
+              ...prev,
+              { role: "assistant", content: delta, timestamp },
+            ]);
+          } else {
+            // append delta to the last assistant message
+            setMessages((prev) => {
+              if (prev.length === 0) return prev;
+              const last = prev[prev.length - 1];
+              if (last.role !== "assistant") {
+                return [
+                  ...prev,
+                  { role: "assistant", content: delta, timestamp },
+                ];
+              }
+              const updated = {
+                ...last,
+                content: (last.content || "") + delta,
+              };
+              return prev.slice(0, -1).concat(updated);
+            });
+          }
+        } else if (event.message?.content) {
+          // final assistant text (non-streamed)
+          setMessages((prev) => [
+            ...prev,
+            { role: "assistant", content: event.message.content, timestamp },
+          ]);
+        }
+        // else if (event.content) { // <- status text from adapter
+        //   // IGNORE to avoid "Generating tool plan..." / "Summarizing results..." bubbles
+        // }
+        break;
+      }
+
+      case "SUMMARY": {
+        // If adapter sends a final summary object { summary: "..."}
+        const text =
+          typeof event.summary === "string"
+            ? event.summary
+            : event.summary?.summary || "";
+        if (text) {
+          setMessages((prev) => [
+            ...prev,
+            { role: "assistant", content: text, timestamp },
+          ]);
+        }
+        break;
+      }
+
+      case "RUN_FINISHED": {
+        setPhase("finished");
+        setProgress(100);
+        streamingMsgIdRef.current = null;
+        break;
+      }
+
+      case "RUN_ERROR": {
+        setPhase("finished");
+        setProgress(100);
+        streamingMsgIdRef.current = null;
+        setMessages((prev) => [
+          ...prev,
+          {
+            role: "assistant",
+            content: "⚠️ " + (event.error || "Run failed"),
+            timestamp,
+          },
+        ]);
+        break;
+      }
+
+      default:
+        // ignore other technical events (HEARTBEAT, TOOL_CALL_END, etc.)
+        break;
+    }
+  }
+
+  return (
+    <div className="chat-container">
+      {/* (Optional) If you have a progress header, you can use phase/progress */}
+      {/* <div className="run-header">
+        <span>{phase === "idle" ? "Ready" : phase}</span>
+        <div className="progress-bar">
+          <div className="progress" style={{ width: `${progress}%` }} />
+        </div>
+      </div> */}
+
+      <div className="messages-container">
+        {messages.map((msg, idx) => (
+          <MessageBubble
+            key={idx}
+            role={msg.role}
+            content={msg.content}
+            timestamp={msg.timestamp}
+          />
+        ))}
+
+        {loading && (
+          <div className="loading-message">
+            <div className="loading-dots">
+              <span></span>
+              <span></span>
+              <span></span>
+            </div>
+            <div className="loading-timestamp">
+              {new Date().toLocaleTimeString([], {
+                hour: "2-digit",
+                minute: "2-digit",
+              })}
+            </div>
+          </div>
+        )}
+        <div ref={messagesEndRef} />
+      </div>
+
+      <div className="input-container">
+        <input
+          type="text"
+          className="message-input"
+          placeholder="Ask about a flight, e.g. 'Why was 6E215 delayed on June 23, 2024?'"
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && !loading && sendMessage()}
+        />
+        <button onClick={sendMessage} className="send-button" disabled={loading}>
+          Send
+        </button>
+      </div>
+    </div>
+  );
+}
+###############################################
+
 function handleEvent(event) {
   const timestamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
