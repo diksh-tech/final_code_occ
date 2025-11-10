@@ -1,3 +1,360 @@
+// src/components/ChatPage.jsx
+import React, { useState, useRef, useEffect, useMemo } from "react";
+import MessageBubble from "./MessageBubble";
+
+const AG_AGENT_ENDPOINT =
+  import.meta.env.VITE_AGENT_ENDPOINT || "http://localhost:8001/agent";
+
+export default function ChatPage() {
+  const [messages, setMessages] = useState([
+    {
+      role: "assistant",
+      content:
+        "Hello! 👋 I'm your FlightOps Agent. Ask me anything about flight operations — delays, fuel, passengers, aircraft details, etc.",
+      timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+    },
+  ]);
+
+  const [input, setInput] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  // Stream/Run state
+  const [phase, setPhase] = useState("idle"); // idle | planning | running tools | summarizing | finished
+  const [progress, setProgress] = useState(0);
+  const [isTyping, setIsTyping] = useState(false); // true while assistant delta chunks are arriving
+
+  const messagesEndRef = useRef(null);
+  const abortRef = useRef(null);
+  const streamingMsgIdRef = useRef(null);
+  const typingTimeoutRef = useRef(null);
+
+  // UI helpers
+  const statusText = useMemo(() => {
+    if (isTyping) return "typing…";
+    if (phase === "planning") return "thinking…";
+    if (phase === "running tools") return "processing…";
+    if (phase === "summarizing") return "summarizing…";
+    if (phase === "finished") return "finished";
+    return null;
+  }, [phase, isTyping]);
+
+  const showStatusStrip = useMemo(() => {
+    return statusText && statusText !== "finished";
+  }, [statusText]);
+
+  const scrollToBottom = () => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  };
+
+  useEffect(() => {
+    scrollToBottom();
+  }, [messages, isTyping]);
+
+  // small helper to stop typing state safely (with slight debounce so it feels natural)
+  const stopTypingSoon = (delayMs = 250) => {
+    clearTimeout(typingTimeoutRef.current);
+    typingTimeoutRef.current = setTimeout(() => setIsTyping(false), delayMs);
+  };
+
+  async function sendMessage() {
+    if (!input.trim()) return;
+
+    const userMessage = {
+      role: "user",
+      content: input.trim(),
+      timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+    };
+    setMessages((prev) => [...prev, userMessage]);
+
+    // reset run state
+    setInput("");
+    setLoading(true);
+    setPhase("planning");
+    setProgress(5);
+    setIsTyping(false);
+    streamingMsgIdRef.current = null;
+    clearTimeout(typingTimeoutRef.current);
+
+    const body = {
+      thread_id: "thread-" + Date.now(),
+      run_id: "run-" + Date.now(),
+      messages: [{ role: "user", content: userMessage.content }],
+      tools: [],
+    };
+
+    abortRef.current = new AbortController();
+
+    try {
+      const resp = await fetch(AG_AGENT_ENDPOINT, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal: abortRef.current.signal,
+      });
+
+      if (!resp.ok) {
+        const errTxt = await resp.text();
+        throw new Error(errTxt || "Request failed");
+      }
+
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buf += decoder.decode(value, { stream: true });
+
+        // split SSE chunks by blank line
+        let idx;
+        while ((idx = buf.indexOf("\n\n")) !== -1) {
+          const raw = buf.slice(0, idx).trim();
+          buf = buf.slice(idx + 2);
+
+          const lines = raw.split("\n");
+          for (const line of lines) {
+            if (!line.startsWith("data: ")) continue;
+            const payload = line.slice(6).trim();
+            if (!payload) continue;
+            try {
+              const event = JSON.parse(payload);
+              handleEvent(event);
+            } catch {
+              // ignore bad line
+            }
+          }
+        }
+      }
+    } catch (err) {
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: "assistant",
+          content: "⚠️ Error: " + (err?.message || "Unknown error"),
+          timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+        },
+      ]);
+    } finally {
+      setLoading(false);
+      abortRef.current = null;
+      stopTypingSoon(400);
+    }
+  }
+
+  function handleEvent(event) {
+    const timestamp = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+
+    switch (event.type) {
+      case "RUN_STARTED":
+        setPhase("planning");
+        setProgress(10);
+        break;
+
+      case "STATE_UPDATE": {
+        const st = event.state || {};
+        if (typeof st.phase === "string") setPhase(st.phase);
+        if (typeof st.progress_pct === "number") {
+          const pct = Math.max(0, Math.min(100, st.progress_pct));
+          setProgress(pct);
+        }
+        break;
+      }
+
+      case "STATE_SNAPSHOT":
+        // plan/results available if you want to render a side drawer; we ignore in chat.
+        break;
+
+      case "TOOL_CALL_START":
+        // running tools phase begins (adapter भी STATE_UPDATE भेजता है)
+        break;
+
+      case "TOOL_CALL_RESULT":
+        // tool outputs को UI बबल में नहीं दिखा रहे — साफ़ UX
+        break;
+
+      case "TEXT_MESSAGE_CONTENT": {
+        // We only care about streaming deltas or final assistant content
+        // Ignore event.content (status strings like "Generating tool plan...")
+        if (event.message?.delta) {
+          const { id, delta } = event.message;
+          setIsTyping(true);
+
+          if (!streamingMsgIdRef.current || streamingMsgIdRef.current !== id) {
+            // new streamed assistant message
+            streamingMsgIdRef.current = id;
+            setMessages((prev) => [
+              ...prev,
+              { role: "assistant", content: delta, timestamp },
+            ]);
+          } else {
+            // append delta to the last assistant message
+            setMessages((prev) => {
+              const last = prev[prev.length - 1];
+              if (!last || last.role !== "assistant") {
+                return [...prev, { role: "assistant", content: delta, timestamp }];
+              }
+              const updated = { ...last, content: (last.content || "") + delta };
+              return prev.slice(0, -1).concat(updated);
+            });
+          }
+
+          // keep typing true while chunks arrive; if gap occurs, stop after small delay
+          stopTypingSoon(900);
+        } else if (event.message?.content) {
+          // non-streamed final text (fallback path)
+          setMessages((prev) => [
+            ...prev,
+            { role: "assistant", content: event.message.content, timestamp },
+          ]);
+          stopTypingSoon(600);
+        }
+        break;
+      }
+
+      case "SUMMARY": {
+        // If adapter sends a final summary object (rare now)
+        const text =
+          typeof event.summary === "string"
+            ? event.summary
+            : event.summary?.summary || "";
+        if (text) {
+          setMessages((prev) => [
+            ...prev,
+            { role: "assistant", content: text, timestamp },
+          ]);
+        }
+        stopTypingSoon(600);
+        break;
+      }
+
+      case "RUN_FINISHED":
+        setPhase("finished");
+        setProgress(100);
+        streamingMsgIdRef.current = null;
+        stopTypingSoon(400);
+        break;
+
+      case "RUN_ERROR":
+        setPhase("finished");
+        setProgress(100);
+        streamingMsgIdRef.current = null;
+        setMessages((prev) => [
+          ...prev,
+          { role: "assistant", content: "⚠️ " + (event.error || "Run failed"), timestamp },
+        ]);
+        stopTypingSoon(200);
+        break;
+
+      default:
+        // ignore HEARTBEAT / TOOL_CALL_END etc.
+        break;
+    }
+  }
+
+  return (
+    <div className="chat-container">
+      {/* Top status strip for thinking / processing / typing */}
+      {showStatusStrip && (
+        <div
+          className="run-header"
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 12,
+            padding: "8px 14px",
+            background: "#ffffff",
+            borderBottom: "1px solid #e5e7eb",
+          }}
+        >
+          <span
+            style={{
+              fontSize: 12,
+              fontWeight: 600,
+              textTransform: "uppercase",
+              color: "#4f46e5",
+              letterSpacing: 0.6,
+            }}
+          >
+            {statusText}
+          </span>
+
+          <div
+            className="progress-bar"
+            style={{
+              flex: 1,
+              height: 6,
+              borderRadius: 999,
+              background: "#eef2ff",
+              overflow: "hidden",
+            }}
+          >
+            <div
+              className="progress"
+              style={{
+                height: "100%",
+                width: `${progress}%`,
+                background:
+                  "linear-gradient(90deg, #4f46e5 0%, #7c3aed 100%)",
+                transition: "width 180ms linear",
+              }}
+            />
+          </div>
+
+          {isTyping && (
+            <div className="loading-dots" style={{ padding: "6px 10px" }}>
+              <span></span>
+              <span></span>
+              <span></span>
+            </div>
+          )}
+        </div>
+      )}
+
+      <div className="messages-container">
+        {messages.map((msg, idx) => (
+          <MessageBubble
+            key={idx}
+            role={msg.role}
+            content={msg.content}
+            timestamp={msg.timestamp}
+          />
+        ))}
+
+        {/* Fallback typing indicator inside list (in case status strip hidden) */}
+        {!showStatusStrip && isTyping && (
+          <div className="loading-message">
+            <div className="loading-dots">
+              <span></span>
+              <span></span>
+              <span></span>
+            </div>
+          </div>
+        )}
+
+        <div ref={messagesEndRef} />
+      </div>
+
+      <div className="input-container">
+        <input
+          type="text"
+          className="message-input"
+          placeholder="Ask about a flight, e.g. 'Why was 6E215 delayed on June 23, 2024?'"
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && !loading && sendMessage()}
+        />
+        <button onClick={sendMessage} className="send-button" disabled={loading}>
+          Send
+        </button>
+      </div>
+    </div>
+  );
+}
+############################
+
+
 import React, { useState, useRef, useEffect } from "react";
 import MessageBubble from "./MessageBubble";
 
