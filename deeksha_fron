@@ -19,6 +19,267 @@ export default function ChatPage() {
 
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
+  const [thinkingPhase, setThinkingPhase] = useState(""); // thinking | processing | typing
+  const [streamBuffer, setStreamBuffer] = useState(""); // stores streamed text buffer
+
+  const messagesEndRef = useRef(null);
+  const abortRef = useRef(null);
+  const streamingMsgIdRef = useRef(null);
+  const typingIntervalRef = useRef(null);
+
+  const scrollToBottom = () => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  };
+
+  useEffect(() => {
+    scrollToBottom();
+  }, [messages, streamBuffer]);
+
+  // stop interval safely
+  function stopTypingStream() {
+    if (typingIntervalRef.current) {
+      clearInterval(typingIntervalRef.current);
+      typingIntervalRef.current = null;
+    }
+  }
+
+  async function sendMessage() {
+    if (!input.trim()) return;
+
+    const userMessage = {
+      role: "user",
+      content: input,
+      timestamp: new Date().toLocaleTimeString([], {
+        hour: "2-digit",
+        minute: "2-digit",
+      }),
+    };
+    setMessages((prev) => [...prev, userMessage]);
+    setInput("");
+    setLoading(true);
+    setThinkingPhase("thinking");
+
+    const body = {
+      thread_id: "thread-" + Date.now(),
+      run_id: "run-" + Date.now(),
+      messages: [userMessage],
+      tools: [],
+    };
+
+    abortRef.current = new AbortController();
+
+    try {
+      const resp = await fetch(AG_AGENT_ENDPOINT, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal: abortRef.current.signal,
+      });
+
+      if (!resp.ok) throw new Error(await resp.text());
+
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+
+        let idx;
+        while ((idx = buf.indexOf("\n\n")) !== -1) {
+          const chunk = buf.slice(0, idx).trim();
+          buf = buf.slice(idx + 2);
+          const lines = chunk.split("\n");
+
+          for (const line of lines) {
+            if (!line.startsWith("data: ")) continue;
+            const payload = line.slice(6).trim();
+            if (!payload) continue;
+
+            try {
+              const event = JSON.parse(payload);
+              handleEvent(event);
+            } catch {
+              console.warn("Bad SSE:", payload);
+            }
+          }
+        }
+      }
+    } catch (err) {
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: "assistant",
+          content: "⚠️ Error: " + (err.message || "Unknown error"),
+          timestamp: new Date().toLocaleTimeString([], {
+            hour: "2-digit",
+            minute: "2-digit",
+          }),
+        },
+      ]);
+    } finally {
+      setLoading(false);
+      stopTypingStream();
+      setThinkingPhase("");
+      abortRef.current = null;
+    }
+  }
+
+  function handleEvent(event) {
+    const timestamp = new Date().toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+
+    switch (event.type) {
+      case "STATE_UPDATE": {
+        const phase = event.state?.phase;
+        if (phase?.includes("planning")) setThinkingPhase("thinking");
+        else if (phase?.includes("running")) setThinkingPhase("processing");
+        else if (phase?.includes("summarizing")) setThinkingPhase("typing");
+        break;
+      }
+
+      case "TEXT_MESSAGE_CONTENT": {
+        // ignore backend plain “Generating tool plan…” etc.
+        if (event.content?.toLowerCase().includes("generating")) return;
+        if (event.content?.toLowerCase().includes("summarizing")) return;
+
+        // delta streaming
+        if (event.message?.delta) {
+          setThinkingPhase("typing");
+          const { id, delta } = event.message;
+
+          // accumulate in buffer
+          setStreamBuffer((prev) => prev + delta);
+
+          // if first delta → create new assistant bubble
+          if (!streamingMsgIdRef.current || streamingMsgIdRef.current !== id) {
+            streamingMsgIdRef.current = id;
+
+            setMessages((prev) => [
+              ...prev,
+              { role: "assistant", content: "", timestamp },
+            ]);
+
+            // start typing animation interval (0.03 sec per char)
+            stopTypingStream();
+            typingIntervalRef.current = setInterval(() => {
+              setMessages((prev) => {
+                if (!streamBuffer) return prev;
+                const last = prev[prev.length - 1];
+                if (!last || last.role !== "assistant") return prev;
+                const nextChar = streamBuffer[0];
+                setStreamBuffer((s) => s.slice(1)); // remove from buffer
+                const updated = {
+                  ...last,
+                  content: (last.content || "") + nextChar,
+                };
+                return [...prev.slice(0, -1), updated];
+              });
+            }, 20); // <- control speed (20ms = smooth typing)
+          }
+        }
+
+        // final message (non-delta)
+        else if (event.message?.content) {
+          stopTypingStream();
+          setStreamBuffer("");
+          setThinkingPhase("");
+          setMessages((prev) => [
+            ...prev,
+            { role: "assistant", content: event.message.content, timestamp },
+          ]);
+        }
+        break;
+      }
+
+      case "RUN_FINISHED": {
+        stopTypingStream();
+        setThinkingPhase("");
+        streamingMsgIdRef.current = null;
+        setStreamBuffer("");
+        break;
+      }
+
+      default:
+        break;
+    }
+  }
+
+  return (
+    <div className="chat-container">
+      <div className="messages-container">
+        {messages.map((msg, idx) => (
+          <MessageBubble
+            key={idx}
+            role={msg.role}
+            content={msg.content}
+            timestamp={msg.timestamp}
+          />
+        ))}
+
+        {/* Thinking / Processing / Typing bubble */}
+        {thinkingPhase && (
+          <div className="assistant-message thinking-bubble">
+            <div className="message-content">
+              {thinkingPhase === "thinking" && <span>🤔 Thinking...</span>}
+              {thinkingPhase === "processing" && <span>⚙️ Processing...</span>}
+              {thinkingPhase === "typing" && (
+                <div className="typing-dots">
+                  <span></span>
+                  <span></span>
+                  <span></span>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        <div ref={messagesEndRef} />
+      </div>
+
+      <div className="input-container">
+        <input
+          type="text"
+          className="message-input"
+          placeholder="Ask about a flight, e.g. 'Why was 6E215 delayed on June 23, 2024?'"
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && !loading && sendMessage()}
+        />
+        <button onClick={sendMessage} className="send-button" disabled={loading}>
+          Send
+        </button>
+      </div>
+    </div>
+  );
+}
+######################################
+
+import React, { useState, useRef, useEffect } from "react";
+import MessageBubble from "./MessageBubble";
+
+const AG_AGENT_ENDPOINT =
+  import.meta.env.VITE_AGENT_ENDPOINT || "http://localhost:8001/agent";
+
+export default function ChatPage() {
+  const [messages, setMessages] = useState([
+    {
+      role: "assistant",
+      content:
+        "Hello! 👋 I'm your FlightOps Agent. Ask me anything about flight operations — delays, fuel, passengers, aircraft details, etc.",
+      timestamp: new Date().toLocaleTimeString([], {
+        hour: "2-digit",
+        minute: "2-digit",
+      }),
+    },
+  ]);
+
+  const [input, setInput] = useState("");
+  const [loading, setLoading] = useState(false);
   const [thinkingPhase, setThinkingPhase] = useState(""); // "thinking" | "processing" | "typing"
 
   const messagesEndRef = useRef(null);
