@@ -4,6 +4,339 @@ import MessageBubble from "./MessageBubble";
 const AG_AGENT_ENDPOINT =
   import.meta.env.VITE_AGENT_ENDPOINT || "http://localhost:8001/agent";
 
+// --- helpers: tokenization for word-by-word streaming ---
+function tokenizeWords(text) {
+  if (!text) return [];
+  const raw = text.replace(/\r\n/g, "\n").split(/(\n)/);
+  const out = [];
+  for (const part of raw) {
+    if (part === "\n") { out.push("\n"); continue; }
+    const words = part.match(/[^\s]+/g) || [];
+    out.push(...words);
+  }
+  return out;
+}
+
+// map backend state → header label
+function prettyPhase(phase) {
+  switch (phase) {
+    case "thinking": return "Thinking…";
+    case "processing": return "Processing…";
+    case "typing": return "Typing…";
+    default: return "";
+  }
+}
+
+export default function ChatPage() {
+  const [messages, setMessages] = useState([
+    {
+      role: "assistant",
+      content:
+        "Hello! 👋 I'm your FlightOps Agent. Ask me anything about flight operations — delays, fuel, passengers, aircraft details, etc.",
+      timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+    },
+  ]);
+
+  const [input, setInput] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  // <<<<<<<<<< PHASE HEADER STATE
+  // "" | thinking | processing | typing
+  const [phase, setPhase] = useState("");
+  const [progress, setProgress] = useState(0);
+
+  // streaming machinery
+  const queueRef = useRef([]);
+  const typingTimerRef = useRef(null);
+  const currentMsgIdRef = useRef(null);
+  const abortRef = useRef(null);
+  const messagesEndRef = useRef(null);
+
+  const scrollToBottom = () =>
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+
+  useEffect(() => { scrollToBottom(); }, [messages]);
+  useEffect(() => () => { stopTypingLoop(); abortRef.current?.abort(); }, []);
+
+  function getLastAssistantContent() {
+    const last = messages[messages.length - 1];
+    return last && last.role === "assistant" ? last.content || "" : "";
+  }
+
+  function startTypingLoop() {
+    if (typingTimerRef.current) return;
+    setPhase("typing"); // header: Typing…
+    setProgress((p) => Math.max(p, 85));
+    typingTimerRef.current = setInterval(() => {
+      if (!queueRef.current.length) { stopTypingLoop(); return; }
+      const next = queueRef.current.shift();
+      const token =
+        next === "\n"
+          ? "\n"
+          : (() => {
+              const last = getLastAssistantContent();
+              if (!last) return next;
+              const needsSpace = last.slice(-1).match(/[\s\n]/) || next.match(/^[,.:;!?%)\]]/);
+              return needsSpace ? next : " " + next;
+            })();
+
+      setMessages((prev) => {
+        if (!prev.length || prev[prev.length - 1].role !== "assistant") {
+          return [
+            ...prev,
+            {
+              role: "assistant",
+              content: token,
+              timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+            },
+          ];
+        }
+        const last = prev[prev.length - 1];
+        const updated = { ...last, content: (last.content || "") + token };
+        return prev.slice(0, -1).concat(updated);
+      });
+
+      setProgress((p) => Math.min(98, p + 2));
+    }, 40); // speed tweak
+  }
+
+  function stopTypingLoop() {
+    if (typingTimerRef.current) {
+      clearInterval(typingTimerRef.current);
+      typingTimerRef.current = null;
+    }
+    // phase ko yahin clear nahi karte; RUN_FINISHED/RUN_ERROR me clear hoga
+  }
+
+  async function readSSEStream(response, onEvent) {
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder("utf-8");
+    let buffer = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
+
+      let idx;
+      while ((idx = buffer.indexOf("\n\n")) !== -1) {
+        const raw = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 2);
+
+        const dataLines = [];
+        for (const line of raw.split("\n")) {
+          if (!line || line.startsWith(":")) continue;
+          if (line.startsWith("data:")) dataLines.push(line.slice(5).trimStart());
+        }
+        if (!dataLines.length) continue;
+
+        try { onEvent(JSON.parse(dataLines.join("\n"))); }
+        catch { /* ignore bad frame */ }
+      }
+    }
+
+    const trailing = buffer.trim();
+    if (trailing) {
+      const dataLines = trailing
+        .split("\n")
+        .filter((l) => l.startsWith("data:"))
+        .map((l) => l.slice(5).trimStart());
+      if (dataLines.length) {
+        try { onEvent(JSON.parse(dataLines.join("\n"))); } catch {}
+      }
+    }
+  }
+
+  async function sendMessage() {
+    if (!input.trim() || loading) return;
+
+    const ts = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+
+    setMessages((prev) => [...prev, { role: "user", content: input, timestamp: ts }]);
+    setInput("");
+    setLoading(true);
+    setProgress(0);
+    setPhase("thinking");      // immediately show Thinking… after send
+    queueRef.current = [];
+    currentMsgIdRef.current = null;
+
+    const body = {
+      thread_id: "thread-" + Date.now(),
+      run_id: "run-" + Date.now(),
+      messages: [{ role: "user", content: input }],
+      tools: [],
+    };
+
+    abortRef.current = new AbortController();
+
+    try {
+      const resp = await fetch(AG_AGENT_ENDPOINT, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal: abortRef.current.signal,
+      });
+      if (!resp.ok || !resp.body) throw new Error(await resp.text() || "Bad response");
+
+      await readSSEStream(resp, handleEvent);
+    } catch (err) {
+      stopTypingLoop();
+      setPhase(""); setProgress(100);
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: "assistant",
+          content: "⚠️ " + (err?.message || "Network error"),
+          timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+        },
+      ]);
+    } finally {
+      setLoading(false);
+      abortRef.current = null;
+    }
+  }
+
+  function handleEvent(event) {
+    const ts = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+
+    switch (event.type) {
+      case "RUN_STARTED":
+        setPhase("thinking");            // header: Thinking…
+        setProgress(5);
+        break;
+
+      case "STATE_UPDATE": {
+        const backendPhase = (event.state?.phase || "").toLowerCase();
+        if (backendPhase.includes("planning")) setPhase("thinking");
+        else if (backendPhase.includes("running")) setPhase("processing"); // running tools
+        else if (backendPhase.includes("summarizing")) setPhase("typing");
+        if (typeof event.state?.progress_pct === "number") {
+          setProgress(Math.max(0, Math.min(100, event.state.progress_pct)));
+        }
+        break;
+      }
+
+      case "TEXT_MESSAGE_CONTENT": {
+        const msg = event.message;
+        if (!msg) break;
+
+        // arriving deltas → switch to Typing…
+        if (msg.delta) {
+          setPhase("typing");
+          currentMsgIdRef.current = msg.id || "no-id";
+          queueRef.current.push(...tokenizeWords(msg.delta));
+          startTypingLoop();
+        } else if (msg.content) {
+          // final text: still stream word-by-word for consistent UX
+          setPhase("typing");
+          queueRef.current.push(...tokenizeWords(msg.content));
+          startTypingLoop();
+        }
+        // NOTE: we ignore event.content (status strings) → no noisy bubbles
+        break;
+      }
+
+      case "SUMMARY": {
+        setPhase("typing");
+        const text = typeof event.summary === "string"
+          ? event.summary
+          : event.summary?.summary || "";
+        if (text) {
+          queueRef.current.push(...tokenizeWords(text));
+          startTypingLoop();
+        }
+        break;
+      }
+
+      case "RUN_FINISHED":
+        // let remaining tokens flush, then hide header
+        if (!queueRef.current.length) {
+          stopTypingLoop(); setPhase(""); setProgress(100);
+        } else {
+          setTimeout(() => { stopTypingLoop(); setPhase(""); setProgress(100); }, 900);
+        }
+        break;
+
+      case "RUN_ERROR":
+        stopTypingLoop(); setPhase(""); setProgress(100);
+        setMessages((prev) => [
+          ...prev,
+          { role: "assistant", content: "⚠️ " + (event.error || "Run failed"), timestamp: ts },
+        ]);
+        break;
+
+      default:
+        // ignore TOOL_* / HEARTBEAT in chat view
+        break;
+    }
+  }
+
+  return (
+    <div className="chat-container">
+      {/* Header visible during thinking/processing/typing */}
+      {phase && (
+        <div className="run-header" style={{ padding: "6px 12px" }}>
+          <span>{prettyPhase(phase)}</span>
+          <div
+            className="progress-bar"
+            style={{ height: 4, marginTop: 6, background: "#e5e7eb", borderRadius: 999 }}
+          >
+            <div
+              className="progress"
+              style={{
+                width: `${progress}%`,
+                height: "100%",
+                borderRadius: 999,
+                background:
+                  "linear-gradient(90deg, rgba(79,70,229,1) 0%, rgba(124,58,237,1) 100%)",
+                transition: "width 140ms linear",
+              }}
+            />
+          </div>
+        </div>
+      )}
+
+      <div className="messages-container">
+        {messages.map((m, i) => (
+          <MessageBubble key={i} role={m.role} content={m.content} timestamp={m.timestamp} />
+        ))}
+
+        {loading && !phase && (
+          <div className="loading-message">
+            <div className="loading-dots"><span></span><span></span><span></span></div>
+            <div className="loading-timestamp">
+              {new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+            </div>
+          </div>
+        )}
+        <div ref={messagesEndRef} />
+      </div>
+
+      <div className="input-container">
+        <input
+          type="text"
+          className="message-input"
+          placeholder="Ask about a flight, e.g. 'Why was 6E215 delayed on June 23, 2024?'"
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && !loading && sendMessage()}
+        />
+        <button className="send-button" onClick={sendMessage} disabled={loading}>
+          Send
+        </button>
+      </div>
+    </div>
+  );
+}
+#############################################
+
+
+import React, { useEffect, useRef, useState } from "react";
+import MessageBubble from "./MessageBubble";
+
+const AG_AGENT_ENDPOINT =
+  import.meta.env.VITE_AGENT_ENDPOINT || "http://localhost:8001/agent";
+
 /**
  * Split incoming text into tokens so we can show word-by-word typing.
  * - keeps real newlines as "\n"
