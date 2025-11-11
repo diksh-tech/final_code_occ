@@ -10,65 +10,74 @@ export default function ChatPage() {
       role: "assistant",
       content:
         "Hello! 👋 I'm your FlightOps Agent. Ask me anything about flight operations — delays, fuel, passengers, aircraft details, etc.",
-      timestamp: new Date().toLocaleTimeString([], {
-        hour: "2-digit",
-        minute: "2-digit",
-      }),
+      timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
     },
   ]);
 
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
-  const [thinkingPhase, setThinkingPhase] = useState(""); // "thinking" | "processing" | "typing"
-  const [buffer, setBuffer] = useState(""); // to hold incoming stream words temporarily
 
+  // UI state for the header/bubble hint (optional)
+  const [phase, setPhase] = useState(""); // "thinking" | "processing" | "typing" | ""
+
+  // --- streaming machinery ---
+  const queueRef = useRef([]);                 // holds upcoming word tokens
+  const typingTimerRef = useRef(null);         // setInterval handle
+  const currentMsgIdRef = useRef(null);        // backend message.id for streaming
   const messagesEndRef = useRef(null);
   const abortRef = useRef(null);
-  const streamingMsgIdRef = useRef(null);
-  const typingIntervalRef = useRef(null);
 
-  const scrollToBottom = () => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  };
+  const scrollToBottom = () => messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  useEffect(() => { scrollToBottom(); }, [messages]);
 
-  useEffect(() => {
-    scrollToBottom();
-  }, [messages]);
+  // Start the word-by-word appender if not running
+  const ensureTypingLoop = () => {
+    if (typingTimerRef.current) return;
+    typingTimerRef.current = setInterval(() => {
+      if (queueRef.current.length === 0) return;
 
-  useEffect(() => {
-    if (thinkingPhase === "typing") startWordStream();
-    return stopWordStream;
-  }, [buffer, thinkingPhase]);
-
-  const startWordStream = () => {
-    if (typingIntervalRef.current) return;
-    typingIntervalRef.current = setInterval(() => {
-      setMessages((prev) => {
-        if (buffer.length === 0) return prev;
-        const words = buffer.split(" ");
-        if (words.length === 0) return prev;
-
-        const nextWord = words.shift();
-        setBuffer(words.join(" "));
-
+      const token = queueRef.current.shift(); // get next word/newline token
+      setMessages(prev => {
         if (prev.length === 0) return prev;
         const last = prev[prev.length - 1];
+
+        // we only append to the last assistant bubble
         if (last.role !== "assistant") return prev;
 
-        const updated = {
-          ...last,
-          content: (last.content ? last.content + " " : "") + nextWord,
-        };
+        // decide spacing: if token is newline or punctuation-leading, avoid extra space
+        const needsSpace =
+          token !== "\n" &&
+          last.content &&
+          !last.content.endsWith(" ") &&
+          !/^[,.:;!?)]/.test(token);
+
+        const nextContent =
+          token === "\n"
+            ? (last.content || "") + "\n"
+            : (last.content || "") + (needsSpace ? " " : "") + token;
+
+        const updated = { ...last, content: nextContent };
         return [...prev.slice(0, -1), updated];
       });
-    }, 100); // <- 100ms per word (tweak for speed)
+    }, 90); // typing speed (ms per token). Tune 60–140 as you like.
   };
 
-  const stopWordStream = () => {
-    if (typingIntervalRef.current) {
-      clearInterval(typingIntervalRef.current);
-      typingIntervalRef.current = null;
+  const stopTypingLoop = () => {
+    if (typingTimerRef.current) {
+      clearInterval(typingTimerRef.current);
+      typingTimerRef.current = null;
     }
+  };
+
+  // Push new text into the queue as word tokens (keeping newlines)
+  const enqueueDelta = (text) => {
+    if (!text) return;
+    const tokens = text
+      .replace(/\r/g, "")
+      .split(/(\s+)/)              // keep spaces as separate entries
+      .filter(t => t.length > 0)   // drop empties
+      .map(t => (t.trim() === "" ? "\n" : t.trim())); // collapse whitespace to newline tokens
+    queueRef.current.push(...tokens);
   };
 
   async function sendMessage() {
@@ -77,21 +86,21 @@ export default function ChatPage() {
     const userMessage = {
       role: "user",
       content: input,
-      timestamp: new Date().toLocaleTimeString([], {
-        hour: "2-digit",
-        minute: "2-digit",
-      }),
+      timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
     };
-    setMessages((prev) => [...prev, userMessage]);
+    setMessages(prev => [...prev, userMessage]);
     setInput("");
     setLoading(true);
-    setThinkingPhase("thinking");
-    setBuffer("");
+    setPhase("thinking");
+    queueRef.current = [];
+    stopTypingLoop();
+    currentMsgIdRef.current = null;
 
     const body = {
       thread_id: "thread-" + Date.now(),
       run_id: "run-" + Date.now(),
       messages: [userMessage],
+      tools: [],
     };
 
     abortRef.current = new AbortController();
@@ -103,7 +112,6 @@ export default function ChatPage() {
         body: JSON.stringify(body),
         signal: abortRef.current.signal,
       });
-
       if (!resp.ok) throw new Error(await resp.text());
 
       const reader = resp.body.getReader();
@@ -120,96 +128,108 @@ export default function ChatPage() {
           const chunk = buf.slice(0, idx).trim();
           buf = buf.slice(idx + 2);
 
-          const lines = chunk.split("\n");
-          for (const line of lines) {
+          for (const line of chunk.split("\n")) {
             if (!line.startsWith("data: ")) continue;
             const payload = line.slice(6).trim();
             if (!payload) continue;
+
             try {
-              const event = JSON.parse(payload);
-              handleEvent(event);
+              const evt = JSON.parse(payload);
+              handleEvent(evt);
             } catch {
-              console.warn("Invalid SSE JSON:", payload);
+              console.warn("Bad SSE JSON:", payload);
             }
           }
         }
       }
     } catch (err) {
-      setMessages((prev) => [
+      setMessages(prev => [
         ...prev,
         {
           role: "assistant",
           content: "⚠️ Error: " + (err.message || "Unknown error"),
-          timestamp: new Date().toLocaleTimeString([], {
-            hour: "2-digit",
-            minute: "2-digit",
-          }),
+          timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
         },
       ]);
     } finally {
-      stopWordStream();
-      setThinkingPhase("");
       setLoading(false);
+      setPhase("");
+      stopTypingLoop();
+      queueRef.current = [];
+      currentMsgIdRef.current = null;
       abortRef.current = null;
     }
   }
 
   function handleEvent(event) {
-    const timestamp = new Date().toLocaleTimeString([], {
-      hour: "2-digit",
-      minute: "2-digit",
-    });
+    const ts = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 
     switch (event.type) {
       case "STATE_UPDATE": {
-        const phase = event.state?.phase;
-        if (phase?.includes("planning")) setThinkingPhase("thinking");
-        else if (phase?.includes("running")) setThinkingPhase("processing");
-        else if (phase?.includes("summarizing")) setThinkingPhase("typing");
+        const p = (event.state?.phase || "").toLowerCase();
+        if (p.includes("planning")) setPhase("thinking");
+        else if (p.includes("running")) setPhase("processing");
+        else if (p.includes("summarizing")) setPhase("typing");
         break;
       }
 
       case "TEXT_MESSAGE_CONTENT": {
-        // skip backend “Generating...” or “Summarizing...”
-        if (event.content?.toLowerCase().includes("generating")) return;
-        if (event.content?.toLowerCase().includes("summarizing")) return;
-
-        if (event.message?.delta) {
-          setThinkingPhase("typing");
-          const { id, delta } = event.message;
-
-          // if new message started
-          if (!streamingMsgIdRef.current || streamingMsgIdRef.current !== id) {
-            streamingMsgIdRef.current = id;
-            stopWordStream();
-            setBuffer("");
-            setMessages((prev) => [
-              ...prev,
-              { role: "assistant", content: "", timestamp },
-            ]);
-          }
-          // append words to buffer
-          setBuffer((prev) => (prev + " " + delta).trim());
+        // Ignore backend status lines
+        if (typeof event.content === "string") {
+          const c = event.content.toLowerCase();
+          if (c.includes("generating tool plan") || c.includes("summarizing results")) return;
         }
 
-        // final content
+        // Streaming delta from adapter
+        if (event.message?.delta) {
+          const { id, delta } = event.message;
+
+          // First delta for this message → create assistant bubble, start typing loop
+          if (!currentMsgIdRef.current || currentMsgIdRef.current !== id) {
+            currentMsgIdRef.current = id;
+            setMessages(prev => [
+              ...prev,
+              { role: "assistant", content: "", timestamp: ts },
+            ]);
+            setPhase("typing");
+            queueRef.current = [];              // reset any old leftovers
+            enqueueDelta(delta);
+            ensureTypingLoop();
+          } else {
+            enqueueDelta(delta);
+            ensureTypingLoop();
+          }
+        }
+        // Non-stream final content (if backend sends one-shot)
         else if (event.message?.content) {
-          stopWordStream();
-          setThinkingPhase("");
-          setBuffer("");
-          setMessages((prev) => [
+          stopTypingLoop();
+          queueRef.current = [];
+          setPhase("");
+          setMessages(prev => [
             ...prev,
-            { role: "assistant", content: event.message.content, timestamp },
+            { role: "assistant", content: event.message.content, timestamp: ts },
           ]);
         }
         break;
       }
 
-      case "RUN_FINISHED":
-        stopWordStream();
-        setThinkingPhase("");
-        setBuffer("");
+      case "RUN_ERROR": {
+        stopTypingLoop();
+        queueRef.current = [];
+        setPhase("");
+        setMessages(prev => [
+          ...prev,
+          { role: "assistant", content: "⚠️ " + (event.error || "Run failed"), timestamp: ts },
+        ]);
         break;
+      }
+
+      case "RUN_FINISHED": {
+        stopTypingLoop();
+        queueRef.current = [];
+        setPhase("");
+        break;
+      }
 
       default:
         break;
@@ -219,31 +239,25 @@ export default function ChatPage() {
   return (
     <div className="chat-container">
       <div className="messages-container">
-        {messages.map((msg, idx) => (
-          <MessageBubble
-            key={idx}
-            role={msg.role}
-            content={msg.content}
-            timestamp={msg.timestamp}
-          />
+        {messages.map((m, i) => (
+          <MessageBubble key={i} role={m.role} content={m.content} timestamp={m.timestamp} />
         ))}
 
-        {/* Thinking / Processing / Typing bubble */}
-        {thinkingPhase && (
+        {/* Optional thinking/processing/typing hint bubble */}
+        {phase && (
           <div className="assistant-message thinking-bubble">
             <div className="message-content">
-              {thinkingPhase === "thinking" && <span>🤔 Thinking...</span>}
-              {thinkingPhase === "processing" && <span>⚙️ Processing...</span>}
-              {thinkingPhase === "typing" && (
-                <div className="typing-dots">
-                  <span></span>
-                  <span></span>
-                  <span></span>
+              {phase === "thinking" && <span>🤔 Thinking…</span>}
+              {phase === "processing" && <span>⚙️ Processing…</span>}
+              {phase === "typing" && (
+                <div className="loading-dots">
+                  <span></span><span></span><span></span>
                 </div>
               )}
             </div>
           </div>
         )}
+
         <div ref={messagesEndRef} />
       </div>
 
@@ -256,14 +270,14 @@ export default function ChatPage() {
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={(e) => e.key === "Enter" && !loading && sendMessage()}
         />
-        <button onClick={sendMessage} className="send-button" disabled={loading}>
+        <button className="send-button" onClick={sendMessage} disabled={loading}>
           Send
         </button>
       </div>
     </div>
   );
 }
-#########################################################
+#########################################
 
 import React, { useState, useRef, useEffect } from "react";
 import MessageBubble from "./MessageBubble";
