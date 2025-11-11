@@ -1,3 +1,418 @@
+import React, { useEffect, useRef, useState } from "react";
+import MessageBubble from "./MessageBubble";
+
+const AG_AGENT_ENDPOINT =
+  import.meta.env.VITE_AGENT_ENDPOINT || "http://localhost:8001/agent";
+
+/**
+ * Split incoming text into tokens so we can show word-by-word typing.
+ * - keeps real newlines as "\n"
+ * - groups punctuation with the preceding word when reasonable
+ */
+function tokenizeWords(text) {
+  if (!text) return [];
+  // Keep newlines as their own tokens, split on whitespace otherwise
+  const raw = text.replace(/\r\n/g, "\n").split(/(\n)/); // keep \n
+  const out = [];
+  for (const part of raw) {
+    if (part === "\n") {
+      out.push("\n");
+      continue;
+    }
+    // split into words while keeping punctuation adjacent
+    // e.g., "Hello," -> ["Hello,"], "(A320)" -> ["(A320)"]
+    const words = part.match(/[^\s]+/g) || [];
+    out.push(...words);
+  }
+  return out;
+}
+
+export default function ChatPage() {
+  const [messages, setMessages] = useState([
+    {
+      role: "assistant",
+      content:
+        "Hello! 👋 I'm your FlightOps Agent. Ask me anything about flight operations — delays, fuel, passengers, aircraft details, etc.",
+      timestamp: new Date().toLocaleTimeString([], {
+        hour: "2-digit",
+        minute: "2-digit",
+      }),
+    },
+  ]);
+
+  const [input, setInput] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  // Show a tiny header state only while the assistant is actually typing
+  const [phase, setPhase] = useState(""); // "", "typing"
+  const [progress, setProgress] = useState(0);
+
+  // Streaming machinery
+  const queueRef = useRef([]);                // tokens waiting to render
+  const typingTimerRef = useRef(null);        // interval for popping tokens
+  const currentMsgIdRef = useRef(null);       // backend message id (for deltas)
+  const abortRef = useRef(null);              // to cancel fetch
+  const messagesEndRef = useRef(null);        // autoscroll
+
+  const scrollToBottom = () =>
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+
+  useEffect(() => {
+    scrollToBottom();
+  }, [messages]);
+
+  useEffect(() => {
+    // cleanup on unmount
+    return () => {
+      stopTypingLoop();
+      if (abortRef.current) abortRef.current.abort();
+    };
+  }, []);
+
+  function startTypingLoop() {
+    if (typingTimerRef.current) return;
+    setPhase("typing");
+    setProgress(10);
+    typingTimerRef.current = setInterval(() => {
+      if (!queueRef.current.length) {
+        // queue empty → stop for now (finalization happens on RUN_FINISHED)
+        stopTypingLoop();
+        return;
+      }
+
+      const next = queueRef.current.shift();
+      const token =
+        next === "\n"
+          ? "\n"
+          : // add a space before the token if the last char isn't whitespace/punctuation
+            (() => {
+              const last = getLastAssistantContent();
+              if (!last) return next;
+              const needsSpace =
+                last.slice(-1).match(/[\s\n]/) || next.match(/^[,.:;!?%)\]]/);
+              return needsSpace ? next : " " + next;
+            })();
+
+      setMessages((prev) => {
+        if (!prev.length || prev[prev.length - 1].role !== "assistant") {
+          // no assistant bubble yet → create
+          return [
+            ...prev,
+            {
+              role: "assistant",
+              content: token,
+              timestamp: new Date().toLocaleTimeString([], {
+                hour: "2-digit",
+                minute: "2-digit",
+              }),
+            },
+          ];
+        }
+        // append to last assistant
+        const last = prev[prev.length - 1];
+        const updated = { ...last, content: (last.content || "") + token };
+        return prev.slice(0, -1).concat(updated);
+      });
+
+      setProgress((p) => Math.min(98, p + 2));
+    }, 35); // ~35ms per token (tweak if you want faster/slower)
+  }
+
+  function stopTypingLoop() {
+    if (typingTimerRef.current) {
+      clearInterval(typingTimerRef.current);
+      typingTimerRef.current = null;
+    }
+    setPhase((ph) => (ph === "typing" ? "" : ph));
+  }
+
+  function getLastAssistantContent() {
+    const last = messages[messages.length - 1];
+    return last && last.role === "assistant" ? last.content || "" : "";
+    }
+
+  /** Robust SSE reader:
+   * - works with \n\n or \r\n\r\n boundaries
+   * - supports multi-line "data:" (concat with "\n")
+   * - ignores comment lines starting with ":"
+   */
+  async function readSSEStream(response, onEvent) {
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder("utf-8");
+    let buffer = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+
+      // normalize CRLF to LF for easier splitting
+      buffer = buffer.replace(/\r\n/g, "\n");
+
+      // split by blank line (SSE event boundary)
+      let sepIndex;
+      while ((sepIndex = buffer.indexOf("\n\n")) !== -1) {
+        const rawEvent = buffer.slice(0, sepIndex);
+        buffer = buffer.slice(sepIndex + 2);
+
+        // parse SSE fields
+        const dataLines = [];
+        for (const line of rawEvent.split("\n")) {
+          if (!line || line.startsWith(":")) continue;
+          if (line.startsWith("data:")) {
+            dataLines.push(line.slice(5).trimStart());
+          }
+          // we ignore "event:", "id:", "retry:" here
+        }
+        if (!dataLines.length) continue;
+
+        const data = dataLines.join("\n");
+        try {
+          const evt = JSON.parse(data);
+          onEvent(evt);
+        } catch (e) {
+          console.warn("SSE JSON parse error:", data);
+        }
+      }
+    }
+
+    // process any trailing event (no final \n\n)
+    const trailing = buffer.trim();
+    if (trailing) {
+      try {
+        const maybe = trailing
+          .split("\n")
+          .filter((l) => l.startsWith("data:"))
+          .map((l) => l.slice(5).trimStart())
+          .join("\n");
+        if (maybe) {
+          const evt = JSON.parse(maybe);
+          onEvent(evt);
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
+  async function sendMessage() {
+    if (!input.trim() || loading) return;
+
+    const ts = new Date().toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+
+    // show user bubble
+    setMessages((prev) => [...prev, { role: "user", content: input, timestamp: ts }]);
+
+    // reset UI streaming state
+    setInput("");
+    setLoading(true);
+    setProgress(0);
+    setPhase(""); // will become "typing" when first delta arrives
+    queueRef.current = [];
+    currentMsgIdRef.current = null;
+
+    const body = {
+      thread_id: "thread-" + Date.now(),
+      run_id: "run-" + Date.now(),
+      messages: [{ role: "user", content: input }],
+      tools: [],
+    };
+
+    abortRef.current = new AbortController();
+
+    try {
+      const resp = await fetch(AG_AGENT_ENDPOINT, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal: abortRef.current.signal,
+      });
+
+      if (!resp.ok || !resp.body) {
+        const txt = await resp.text();
+        throw new Error(txt || "Bad response");
+      }
+
+      await readSSEStream(resp, handleEvent);
+    } catch (err) {
+      stopTypingLoop();
+      setPhase("");
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: "assistant",
+          content: "⚠️ " + (err?.message || "Network error"),
+          timestamp: new Date().toLocaleTimeString([], {
+            hour: "2-digit",
+            minute: "2-digit",
+          }),
+        },
+      ]);
+    } finally {
+      setLoading(false);
+      abortRef.current = null;
+    }
+  }
+
+  function handleEvent(event) {
+    const ts = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+
+    switch (event.type) {
+      case "RUN_STARTED":
+        setProgress(5);
+        break;
+
+      case "STATE_UPDATE":
+        // we only show the header when actually typing; still track progress silently
+        if (typeof event.state?.progress_pct === "number") {
+          setProgress(Math.max(0, Math.min(100, event.state.progress_pct)));
+        }
+        break;
+
+      case "TEXT_MESSAGE_CONTENT": {
+        // We ignore plain event.content (like "Generating tool plan...")
+        // and only use streaming deltas / final assistant message.
+        const msg = event.message;
+        if (!msg) break;
+
+        if (msg.delta) {
+          // stream typing: enqueue tokens and start loop
+          const id = msg.id || "no-id";
+          currentMsgIdRef.current = id;
+          queueRef.current.push(...tokenizeWords(msg.delta));
+          startTypingLoop();
+        } else if (msg.content) {
+          // final whole text: if we already have a streaming bubble, append; else add new
+          stopTypingLoop();
+          const tokens = tokenizeWords(msg.content);
+          setPhase("typing");
+          setProgress(95);
+          // push tokens and let the loop render the last bits smoothly
+          queueRef.current.push(...tokens);
+          startTypingLoop();
+        }
+        break;
+      }
+
+      case "SUMMARY": {
+        // Some adapters send a {summary: "..."} at the end
+        const text =
+          typeof event.summary === "string"
+            ? event.summary
+            : event.summary?.summary || "";
+        if (text) {
+          stopTypingLoop();
+          queueRef.current = tokenizeWords(text);
+          startTypingLoop();
+        }
+        break;
+      }
+
+      case "RUN_ERROR": {
+        stopTypingLoop();
+        setPhase("");
+        setProgress(100);
+        setMessages((prev) => [
+          ...prev,
+          { role: "assistant", content: "⚠️ " + (event.error || "Run failed"), timestamp: ts },
+        ]);
+        break;
+      }
+
+      case "RUN_FINISHED": {
+        // finish up gracefully; if queue still has tokens, let them render
+        if (!queueRef.current.length) {
+          stopTypingLoop();
+          setPhase("");
+          setProgress(100);
+        } else {
+          // allow a short tail; stop after a second
+          setTimeout(() => {
+            stopTypingLoop();
+            setPhase("");
+            setProgress(100);
+          }, 1000);
+        }
+        break;
+      }
+
+      default:
+        // ignore TOOL_* and HEARTBEAT in chat view
+        break;
+    }
+  }
+
+  return (
+    <div className="chat-container">
+      {/* Optional minimal header visible only when actually typing */}
+      {phase === "typing" && (
+        <div className="run-header" style={{ padding: "6px 12px" }}>
+          <span>Assistant is typing…</span>
+          <div
+            className="progress-bar"
+            style={{
+              height: 4,
+              marginTop: 6,
+              background: "#e5e7eb",
+              borderRadius: 999,
+            }}
+          >
+            <div
+              className="progress"
+              style={{
+                width: `${progress}%`,
+                height: "100%",
+                borderRadius: 999,
+                background:
+                  "linear-gradient(90deg, rgba(79,70,229,1) 0%, rgba(124,58,237,1) 100%)",
+                transition: "width 140ms linear",
+              }}
+            />
+          </div>
+        </div>
+      )}
+
+      <div className="messages-container">
+        {messages.map((m, i) => (
+          <MessageBubble key={i} role={m.role} content={m.content} timestamp={m.timestamp} />
+        ))}
+
+        {loading && phase !== "typing" && (
+          <div className="loading-message">
+            <div className="loading-dots">
+              <span></span>
+              <span></span>
+              <span></span>
+            </div>
+            <div className="loading-timestamp">
+              {new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+            </div>
+          </div>
+        )}
+        <div ref={messagesEndRef} />
+      </div>
+
+      <div className="input-container">
+        <input
+          type="text"
+          className="message-input"
+          placeholder="Ask about a flight, e.g. 'Why was 6E215 delayed on June 23, 2024?'"
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && !loading && sendMessage()}
+        />
+        <button className="send-button" onClick={sendMessage} disabled={loading}>
+          Send
+        </button>
+      </div>
+    </div>
+  );
+}
+
 #########################################
 
 import React, { useState, useRef, useEffect } from "react";
