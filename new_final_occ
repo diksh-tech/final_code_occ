@@ -1,3 +1,1133 @@
+# client.py
+import os
+import json
+import logging
+import asyncio
+from typing import List, Dict, Any
+
+from dotenv import load_dotenv
+from openai import AzureOpenAI
+from mcp import ClientSession
+from mcp.client.streamable_http import streamablehttp_client
+
+from tool_registry import TOOLS
+
+# Load environment variables
+load_dotenv()
+
+MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "http://127.0.0.1:8000").rstrip("/")
+
+# Azure OpenAI configuration
+AZURE_OPENAI_KEY = os.getenv("AZURE_OPENAI_KEY")
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
+AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
+AZURE_API_VERSION = os.getenv("AZURE_API_VERSION", "2024-12-01-preview")
+
+if not AZURE_OPENAI_KEY:
+    raise RuntimeError("❌ AZURE_OPENAI_KEY not set in environment")
+
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logger = logging.getLogger("FlightOps.MCPClient")
+
+# Initialize Azure OpenAI client
+client_azure = AzureOpenAI(
+    api_key=AZURE_OPENAI_KEY,
+    api_version=AZURE_API_VERSION,
+    azure_endpoint=AZURE_OPENAI_ENDPOINT
+)
+
+# ---------------------------------------------------------------------
+#  SYSTEM PROMPTS
+# ---------------------------------------------------------------------
+def _build_tool_prompt() -> str:
+    """Convert TOOLS dict into compact text to feed the LLM."""
+    lines = []
+    for name, meta in TOOLS.items():
+        arg_str = ", ".join(meta["args"])
+        lines.append(f"- {name}({arg_str}): {meta['desc']}")
+    return "\n".join(lines)
+
+
+SYSTEM_PROMPT_PLAN = f"""
+You are an assistant that converts user questions into MCP tool calls.
+
+Available tools:
+{_build_tool_prompt()}
+
+... (same prompt as before) ...
+"""
+
+SYSTEM_PROMPT_SUMMARIZE = """
+You are an assistant that summarizes tool outputs into a concise, readable answer.
+Be factual, short, and helpful.
+"""
+
+# ---------------------------------------------------------------------
+#  FLIGHTOPS MCP CLIENT CLASS
+# ---------------------------------------------------------------------
+class FlightOpsMCPClient:
+    def __init__(self, base_url: str = None):
+        self.base_url = (base_url or MCP_SERVER_URL).rstrip("/")
+        self.session: ClientSession = None
+        self._client_context = None
+
+    # -------------------- CONNECTION HANDLERS -------------------------
+    async def connect(self):
+        try:
+            logger.info(f"Connecting to MCP server at {self.base_url}")
+            self._client_context = streamablehttp_client(self.base_url)
+            read_stream, write_stream, _ = await self._client_context.__aenter__()
+            self.session = ClientSession(read_stream, write_stream)
+            await self.session.__aenter__()
+            await self.session.initialize()
+            logger.info("✅ Connected to MCP server successfully")
+        except Exception as e:
+            logger.error(f"Failed to connect to MCP server: {e}")
+            raise
+
+    async def disconnect(self):
+        try:
+            if self.session:
+                await self.session.__aexit__(None, None, None)
+            if self._client_context:
+                await self._client_context.__aexit__(None, None, None)
+            logger.info("Disconnected from MCP server")
+        except Exception as e:
+            logger.error(f"Error during disconnect: {e}")
+
+    # -------------------- AZURE OPENAI WRAPPER -------------------------
+    def _call_azure_openai(self, messages: list, temperature: float = 0.2, max_tokens: int = 2048) -> dict:
+        """
+        Call Azure OpenAI, return dict { content: str, usage: {prompt_tokens, completion_tokens, total_tokens} }
+        """
+        try:
+            completion = client_azure.chat.completions.create(
+                model=AZURE_OPENAI_DEPLOYMENT,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            usage_obj = getattr(completion, "usage", None)
+            usage = None
+            if usage_obj is not None:
+                usage = {
+                    "prompt_tokens": getattr(usage_obj, "prompt_tokens", None),
+                    "completion_tokens": getattr(usage_obj, "completion_tokens", None),
+                    "total_tokens": getattr(usage_obj, "total_tokens", None),
+                }
+            return {
+                "content": completion.choices[0].message.content,
+                "usage": usage
+            }
+        except Exception as e:
+            logger.error(f"Azure OpenAI API error: {e}")
+            return {"content": json.dumps({"error": str(e)}), "usage": None}
+
+    # -------------------- MCP TOOL CALLS -------------------------
+    async def list_tools(self) -> dict:
+        try:
+            if not self.session:
+                await self.connect()
+            tools_list = await self.session.list_tools()
+            tools_dict = {tool.name: {"description": tool.description, "inputSchema": tool.inputSchema} for tool in tools_list.tools}
+            return {"tools": tools_dict}
+        except Exception as e:
+            logger.error(f"Error listing tools: {e}")
+            return {"error": str(e)}
+
+    async def invoke_tool(self, tool_name: str, args: dict) -> dict:
+        try:
+            if not self.session:
+                await self.connect()
+            logger.info(f"Calling tool: {tool_name} with args: {args}")
+            result = await self.session.call_tool(tool_name, args)
+
+            if result.content:
+                content_items = []
+                for item in result.content:
+                    if hasattr(item, 'text'):
+                        try:
+                            content_items.append(json.loads(item.text))
+                        except json.JSONDecodeError:
+                            content_items.append(item.text)
+                if len(content_items) == 1:
+                    return content_items[0]
+                return {"results": content_items}
+
+            return {"error": "No content in response"}
+        except Exception as e:
+            logger.error(f"Error invoking tool {tool_name}: {e}")
+            return {"error": str(e)}
+
+    # -------------------- LLM PLANNING & SUMMARIZATION -------------------------
+    def plan_tools(self, user_query: str) -> dict:
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT_PLAN},
+            {"role": "user", "content": user_query},
+        ]
+
+        res = self._call_azure_openai(messages, temperature=0.1)
+        content = res.get("content")
+        plan_usage = res.get("usage")
+        if not content:
+            logger.warning("⚠️ LLM returned empty response during plan generation.")
+            return {"plan": [], "llm_usage": plan_usage}
+
+        cleaned = content.strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.strip("`")
+            if cleaned.lower().startswith("json"):
+                cleaned = cleaned[4:].strip()
+            cleaned = cleaned.replace("```", "").strip()
+
+        if cleaned != content:
+            logger.debug(f"🔍 Cleaned LLM plan output:\n{cleaned}")
+
+        try:
+            plan = json.loads(cleaned)
+            if isinstance(plan, dict) and "plan" in plan:
+                return {"plan": plan["plan"], "llm_usage": plan_usage}
+            else:
+                logger.warning("⚠️ LLM output did not contain 'plan' key.")
+                return {"plan": [], "llm_usage": plan_usage}
+        except json.JSONDecodeError:
+            logger.warning(f"❌ Could not parse LLM plan output after cleaning:\n{cleaned}")
+            return {"plan": [], "llm_usage": plan_usage}
+
+    def summarize_results(self, user_query: str, plan: list, results: list) -> dict:
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT_SUMMARIZE},
+            {"role": "user", "content": f"Question:\n{user_query}"},
+            {"role": "assistant", "content": f"Plan:\n{json.dumps(plan, indent=2)}"},
+            {"role": "assistant", "content": f"Results:\n{json.dumps(results, indent=2)}"},
+        ]
+        res = self._call_azure_openai(messages, temperature=0.3)
+        return {"summary": res.get("content"), "llm_usage": res.get("usage")}
+
+    async def run_query(self, user_query: str) -> dict:
+        try:
+            logger.info(f"User query: {user_query}")
+            plan_data = self.plan_tools(user_query)
+            plan = plan_data.get("plan", [])
+            planning_usage = plan_data.get("llm_usage")
+            if not plan:
+                return {"error": "LLM did not produce a valid tool plan.", "token_usage": {"planning": planning_usage}}
+
+            results = []
+            for step in plan:
+                tool = step.get("tool")
+                args = step.get("arguments", {})
+
+                # Clean up bad args
+                args = {k: v for k, v in args.items() if v and str(v).strip().lower() != "unknown"}
+
+                # Safety for MongoDB query
+                if tool == "raw_mongodb_query":
+                    query_json = args.get("query_json", "")
+                    if not query_json:
+                        results.append({"raw_mongodb_query": {"error": "Empty query_json"}})
+                        continue
+                    # Enforce safe default limit
+                    args["limit"] = int(args.get("limit", 50))
+                    logger.info(f"Executing raw MongoDB query: {query_json}")
+
+                resp = await self.invoke_tool(tool, args)
+                results.append({tool: resp})
+
+            summary = self.summarize_results(user_query, plan, results)
+            summarization_usage = summary.get("llm_usage")
+
+            def _safe_int(x):
+                try:
+                    return int(x) if x is not None else 0
+                except:
+                    return 0
+
+            total = {
+                "prompt_tokens": _safe_int(planning_usage and planning_usage.get("prompt_tokens")) +
+                                 _safe_int(summarization_usage and summarization_usage.get("prompt_tokens")),
+                "completion_tokens": _safe_int(planning_usage and planning_usage.get("completion_tokens")) +
+                                     _safe_int(summarization_usage and summarization_usage.get("completion_tokens")),
+                "total_tokens": _safe_int(planning_usage and planning_usage.get("total_tokens")) +
+                                _safe_int(summarization_usage and summarization_usage.get("total_tokens")),
+            }
+
+            return {
+                "plan": plan,
+                "results": results,
+                "summary": {"summary": summary.get("summary")},
+                "token_usage": {
+                    "planning": planning_usage,
+                    "summarization": summarization_usage,
+                    "total": total
+                }
+            }
+        except Exception as e:
+            logger.error(f"Error in run_query: {e}")
+            return {"error": str(e)}
+#################################################
+# ag_ui_adapter.py
+import os
+import json
+import asyncio
+import time
+import uuid
+from typing import AsyncGenerator, List
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from client import FlightOpsMCPClient
+
+app = FastAPI(title="FlightOps — AG-UI Adapter")
+
+# CORS (adjust origins for your Vite origin)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],           # lock down in prod
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+mcp_client = FlightOpsMCPClient()
+
+def sse_event(data: dict) -> str:
+    """Encode one SSE event (JSON payload)"""
+    return f"data: {json.dumps(data, default=str, ensure_ascii=False)}\n\n"
+
+async def ensure_mcp_connected():
+    if not mcp_client.session:
+        await mcp_client.connect()
+
+@app.on_event("startup")
+async def startup_event():
+    try:
+        await ensure_mcp_connected()
+    except Exception:
+        # don't crash; /health will reflect status
+        pass
+
+@app.get("/")
+async def root():
+    return {"message": "FlightOps AG-UI Adapter running", "status": "ok"}
+
+@app.get("/health")
+async def health():
+    try:
+        await ensure_mcp_connected()
+        return {"status": "healthy", "mcp_connected": True}
+    except Exception as e:
+        return {"status": "unhealthy", "mcp_connected": False, "error": str(e)}
+
+def chunk_text(txt: str, max_len: int = 200) -> List[str]:
+    """
+    Split text into small chunks for streaming as typing.
+    Prefer sentence boundaries; fallback by length.
+    """
+    txt = txt or ""
+    parts: List[str] = []
+    buf = ""
+
+    def flush():
+        nonlocal buf
+        if buf:
+            parts.append(buf)
+            buf = ""
+
+    for ch in txt:
+        buf += ch
+        # flush at sentence end or when too long
+        if ch in ".!?\n" and len(buf) >= max_len // 2:
+            flush()
+        elif len(buf) >= max_len:
+            flush()
+    flush()
+    return parts
+
+def format_flight_data(raw_text: str) -> str:
+    """
+    Convert raw flight data (possibly produced by the LLM) into a clean plain-text format.
+    Removes duplicate keys and produces sectioned readable output (no Markdown).
+    """
+    if not raw_text:
+        return "✈️ Flight Information\n\nNo data available."
+
+    lines = raw_text.splitlines()
+    flight_info = {}
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        if ':' in line:
+            clean = line.lstrip('-* ').strip()
+            key_part, value_part = clean.split(':', 1)
+            key = key_part.strip()
+            value = value_part.strip().replace('*', '')
+            if key and key not in flight_info:
+                flight_info[key] = value
+
+    if not flight_info:
+        seen = set()
+        out_lines = []
+        for ln in lines:
+            ln_clean = ln.replace('*', '').strip()
+            if ln_clean and ln_clean not in seen:
+                seen.add(ln_clean)
+                out_lines.append(ln_clean)
+        return "✈️ Flight Information\n\n" + "\n".join(out_lines)
+
+    out = []
+    out.append("✈️ Flight Information\n")
+    out.append("📋 Basic Details")
+    if 'Carrier' in flight_info:
+        out.append(f"Carrier: {flight_info['Carrier']}")
+    if 'Flight Number' in flight_info:
+        out.append(f"Flight Number: {flight_info['Flight Number']}")
+    if 'Date' in flight_info:
+        out.append(f"Date: {flight_info['Date']}")
+    if 'Route' in flight_info:
+        out.append(f"Route: {flight_info['Route']}")
+    out.append("")
+
+    out.append("🕐 Schedule & Timing")
+    if 'Scheduled Departure' in flight_info:
+        out.append(f"Departure: {flight_info['Scheduled Departure']}")
+    if 'Scheduled Arrival' in flight_info:
+        out.append(f"Arrival: {flight_info['Scheduled Arrival']}")
+    if 'Scheduled Block Time' in flight_info:
+        out.append(f"Scheduled Duration: {flight_info['Scheduled Block Time']}")
+    if 'Actual Block Time' in flight_info:
+        out.append(f"Actual Duration: {flight_info['Actual Block Time']}")
+    out.append("")
+
+    out.append("📊 Flight Status")
+    if 'Flight Type' in flight_info:
+        out.append(f"Type: {flight_info['Flight Type']}")
+    if 'Operational Status' in flight_info:
+        status = flight_info['Operational Status']
+        status_emoji = "✅" if "Scheduled" in status or "On Time" in status else "⚠️" if "Delayed" in status else "🔄"
+        out.append(f"Status: {status_emoji} {status}")
+
+    if 'Scheduled Block Time' in flight_info and 'Actual Block Time' in flight_info:
+        try:
+            scheduled = flight_info['Scheduled Block Time']
+            actual = flight_info['Actual Block Time']
+            if scheduled and actual and scheduled != actual:
+                out.append("")
+                out.append("📈 Performance")
+                if "ahead" in raw_text.lower() or "earlier" in raw_text.lower():
+                    out.append("🟢 Flight arrived ahead of schedule.")
+                else:
+                    out.append("Performance info available in details above.")
+        except Exception:
+            pass
+
+    return "\n".join(out)
+
+@app.post("/agent", response_class=StreamingResponse)
+async def run_agent(request: Request):
+    """
+    AG-UI compatible streaming endpoint (SSE).
+    Expected body:
+      {
+        thread_id?, run_id?,
+        messages: [{role, content}, ...],
+        tools?: []
+      }
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    thread_id = body.get("thread_id") or f"thread-{uuid.uuid4().hex[:8]}"
+    run_id = body.get("run_id") or f"run-{uuid.uuid4().hex[:8]}"
+    messages = body.get("messages", [])
+
+    # last user message as query
+    user_query = ""
+    if messages:
+        last = messages[-1]
+        if isinstance(last, dict) and last.get("role") == "user":
+            user_query = last.get("content", "") or ""
+        elif isinstance(last, str):
+            user_query = last
+
+    if not user_query.strip():
+        raise HTTPException(status_code=400, detail="No user query found")
+
+    async def event_stream() -> AsyncGenerator[str, None]:
+        last_heartbeat = time.time()
+
+        # --- RUN STARTED
+        yield sse_event({"type": "RUN_STARTED", "thread_id": thread_id, "run_id": run_id})
+
+        # THINKING: Initial analysis
+        yield sse_event({
+            "type": "STATE_UPDATE",
+            "state": {
+                "phase": "thinking",
+                "progress_pct": 5,
+                "message": "🧠 Analyzing your flight query..."
+            }
+        })
+
+        # ensure MCP
+        try:
+            await ensure_mcp_connected()
+        except Exception as e:
+            yield sse_event({"type": "RUN_ERROR", "error": f"MCP connect failed: {e}"})
+            return
+
+        loop = asyncio.get_event_loop()
+
+        # --- PLAN (THINKING phase)
+        yield sse_event({
+            "type": "STATE_UPDATE",
+            "state": {
+                "phase": "thinking",
+                "progress_pct": 15,
+                "message": "📋 Planning which flight data tools to use..."
+            }
+        })
+
+        try:
+            # plan_tools returns {"plan": [...], "llm_usage": {...}} in the updated client
+            plan_data = await loop.run_in_executor(None, mcp_client.plan_tools, user_query)
+        except Exception as e:
+            yield sse_event({"type": "RUN_ERROR", "error": f"Planner error: {e}"})
+            return
+
+        plan = plan_data.get("plan", []) if isinstance(plan_data, dict) else []
+        planning_usage = plan_data.get("llm_usage") if isinstance(plan_data, dict) else None
+
+        yield sse_event({"type": "STATE_SNAPSHOT", "snapshot": {"plan": plan}})
+
+        if not plan:
+            yield sse_event({
+                "type": "TEXT_MESSAGE_CONTENT",
+                "message": {
+                    "id": f"msg-{uuid.uuid4().hex[:8]}",
+                    "role": "assistant",
+                    "content": "I couldn't generate a valid plan for your query. Please try rephrasing."
+                }
+            })
+            yield sse_event({"type": "STATE_UPDATE", "state": {"phase": "finished", "progress_pct": 100}})
+            yield sse_event({"type": "RUN_FINISHED", "run_id": run_id})
+            return
+
+        # --- PROCESSING: Tool execution
+        yield sse_event({
+            "type": "STATE_UPDATE",
+            "state": {
+                "phase": "processing",
+                "progress_pct": 20,
+                "message": f"🛠️ Executing {len(plan)} flight data tools..."
+            }
+        })
+
+        results = []
+        num_steps = max(1, len(plan))
+        per_step = 60.0 / num_steps  # 20% to 80%
+        current_progress = 20.0
+
+        for step_index, step in enumerate(plan):
+            if await request.is_disconnected():
+                return
+
+            tool_name = step.get("tool")
+            args = step.get("arguments", {}) or {}
+
+            # Update processing status for current tool
+            yield sse_event({
+                "type": "STATE_UPDATE",
+                "state": {
+                    "phase": "processing",
+                    "progress_pct": round(current_progress),
+                    "message": f"🔧 Running {tool_name}..."
+                }
+            })
+
+            tool_call_id = f"toolcall-{uuid.uuid4().hex[:8]}"
+
+            # Tool call events
+            yield sse_event({
+                "type": "TOOL_CALL_START",
+                "toolCallId": tool_call_id,
+                "toolCallName": tool_name,
+                "parentMessageId": None
+            })
+
+            yield sse_event({
+                "type": "TOOL_CALL_ARGS",
+                "toolCallId": tool_call_id,
+                "delta": json.dumps(args, ensure_ascii=False)
+            })
+            yield sse_event({"type": "TOOL_CALL_END", "toolCallId": tool_call_id})
+
+            # call tool
+            try:
+                tool_result = await mcp_client.invoke_tool(tool_name, args)
+            except Exception as exc:
+                tool_result = {"error": str(exc)}
+
+            # result
+            yield sse_event({
+                "type": "TOOL_CALL_RESULT",
+                "message": {
+                    "id": f"msg-{uuid.uuid4().hex[:8]}",
+                    "role": "tool",
+                    "content": json.dumps(tool_result, ensure_ascii=False),
+                    "tool_call_id": tool_call_id,
+                }
+            })
+            results.append({tool_name: tool_result})
+
+            yield sse_event({
+                "type": "STEP_FINISHED",
+                "step_index": step_index,
+                "tool": tool_name
+            })
+
+            # update progress
+            current_progress = min(80.0, 20.0 + per_step * (step_index + 1))
+
+            # heartbeat every ~15s while long tools run
+            if time.time() - last_heartbeat > 15:
+                yield sse_event({"type": "HEARTBEAT", "ts": time.time()})
+                last_heartbeat = time.time()
+
+        # --- TYPING: Result generation
+        yield sse_event({
+            "type": "STATE_UPDATE",
+            "state": {
+                "phase": "typing",
+                "progress_pct": 85,
+                "message": "✍️ Generating your flight analysis..."
+            }
+        })
+
+        try:
+            # summarize_results returns {"summary": "...", "llm_usage": {...}}
+            summary_obj = await loop.run_in_executor(None, mcp_client.summarize_results, user_query, plan, results)
+            assistant_text = summary_obj.get("summary", "") if isinstance(summary_obj, dict) else str(summary_obj)
+            summarization_usage = summary_obj.get("llm_usage") if isinstance(summary_obj, dict) else None
+        except Exception as e:
+            assistant_text = f"❌ Failed to summarize results: {e}"
+            summarization_usage = None
+
+        # Emit token usage event (planning + summarization)
+        yield sse_event({"type": "TOKEN_USAGE", "token_usage": {"planning": planning_usage, "summarization": summarization_usage}})
+
+        # Optionally format assistant_text to plain flight data if it looks like flight info
+        # Very small heuristic: if assistant_text contains 'Flight Number' or 'Scheduled'
+        formatted_text = assistant_text
+        if any(k in (assistant_text or "") for k in ("Flight Number", "Scheduled Departure", "Route", "Flight Information", "📋")):
+            try:
+                formatted_text = format_flight_data(assistant_text)
+            except Exception:
+                formatted_text = assistant_text
+
+        # Stream summary as chunks (typing effect)
+        msg_id = f"msg-{uuid.uuid4().hex[:8]}"
+
+        # Start the message
+        yield sse_event({
+            "type": "TEXT_MESSAGE_CONTENT",
+            "message": {
+                "id": msg_id,
+                "role": "assistant",
+                "content": ""  # Start with empty content
+            }
+        })
+
+        # Stream chunks with typing effect
+        chunks = chunk_text(formatted_text, max_len=150)
+        for i, chunk in enumerate(chunks):
+            yield sse_event({
+                "type": "TEXT_MESSAGE_CONTENT",
+                "message": {
+                    "id": msg_id,
+                    "role": "assistant",
+                    "delta": chunk  # AG-UI delta for streaming
+                }
+            })
+
+            # Update typing progress
+            typing_progress = 85 + (i / max(1, len(chunks))) * 15
+            yield sse_event({
+                "type": "STATE_UPDATE",
+                "state": {
+                    "phase": "typing",
+                    "progress_pct": round(typing_progress),
+                    "message": "✍️ Generating your flight analysis..."
+                }
+            })
+
+            await asyncio.sleep(0.03)  # Typing speed
+
+        # Final state
+        yield sse_event({"type": "STATE_SNAPSHOT", "snapshot": {"plan": plan, "results": results}})
+        yield sse_event({
+            "type": "STATE_UPDATE",
+            "state": {
+                "phase": "finished",
+                "progress_pct": 100,
+                "message": "✅ Analysis complete"
+            }
+        })
+        yield sse_event({"type": "RUN_FINISHED", "run_id": run_id})
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+#######################################################
+// src/components/MessageBubble.jsx
+import React from "react";
+
+export default function MessageBubble({ role, content, timestamp }) {
+  content = content || "";
+
+  const isFlightData =
+    typeof content === "string" &&
+    (content.includes("Flight Information") ||
+      content.includes("Flight Number") ||
+      content.includes("Scheduled Departure") ||
+      content.includes("Route:") ||
+      content.includes("📋 Basic Details"));
+
+  const isAssistantSummary =
+    role === "assistant" &&
+    typeof content === "string" &&
+    (content.includes("\n\n") || content.includes("•") || content.includes("- "));
+
+  function renderFlightData(text) {
+    const lines = text.split("\n");
+    return (
+      <div className="flight-data-container">
+        {lines.map((ln, i) => {
+          const line = ln.trim();
+          if (!line) return <div key={i} className="flight-data-spacing" />;
+
+          if (
+            line.startsWith("✈️") ||
+            line.startsWith("📋") ||
+            line.startsWith("🕐") ||
+            line.startsWith("📊") ||
+            line.startsWith("📈")
+          ) {
+            const emoji = line.charAt(0);
+            const title = line.slice(1).trim();
+            return (
+              <div key={i} className="flight-section-header">
+                <span className="section-emoji">{emoji}</span>
+                <span className="section-title">{title}</span>
+              </div>
+            );
+          }
+
+          if (line.includes(":")) {
+            const [k, ...rest] = line.split(":");
+            const v = rest.join(":").trim();
+            return (
+              <div key={i} className="flight-data-line">
+                <div className="flight-data-key">{k.trim()}:</div>
+                <div className="flight-data-value">{v}</div>
+              </div>
+            );
+          }
+
+          return (
+            <div key={i} className="flight-data-text">
+              {line}
+            </div>
+          );
+        })}
+      </div>
+    );
+  }
+
+  function renderAssistantSummary(text) {
+    const parts = text.split(/\n{2,}/).map((p) => p.trim()).filter(Boolean);
+
+    return (
+      <div className="assistant-summary">
+        {parts.map((p, idx) => {
+          if (p.includes("•") || p.includes("- ")) {
+            const lines = p.split("\n").map((l) => l.replace(/^[\-\u2022]\s*/, "").trim()).filter(Boolean);
+            return (
+              <div key={idx} className="assistant-summary-section">
+                {idx === 0 && <div className="assistant-summary-title">Summary</div>}
+                <ul className="assistant-bullets">
+                  {lines.map((li, i) => (
+                    <li key={i}>{li}</li>
+                  ))}
+                </ul>
+              </div>
+            );
+          }
+
+          return (
+            <div key={idx} className="assistant-summary-section">
+              {idx === 0 && <div className="assistant-summary-title">Summary</div>}
+              <div className="assistant-summary-paragraph">{p}</div>
+            </div>
+          );
+        })}
+      </div>
+    );
+  }
+
+  return (
+    <div className={`message ${role}-message`}>
+      <div className="message-content">
+        {role === "assistant" && isFlightData ? (
+          renderFlightData(content)
+        ) : role === "assistant" && isAssistantSummary ? (
+          renderAssistantSummary(content)
+        ) : role === "assistant" ? (
+          <div className="assistant-text" style={{ whiteSpace: "pre-wrap" }}>
+            {content}
+          </div>
+        ) : (
+          <div className="user-text" style={{ whiteSpace: "pre-wrap" }}>
+            {content}
+          </div>
+        )}
+
+        <div className="message-timestamp">{timestamp}</div>
+      </div>
+    </div>
+  );
+}
+###########################################3
+// src/components/ChatPage.jsx
+import React, { useState, useRef, useEffect } from "react";
+import MessageBubble from "./MessageBubble";
+
+const AG_AGENT_ENDPOINT = import.meta.env.VITE_AGENT_ENDPOINT || "http://localhost:8001/agent";
+
+export default function ChatPage() {
+    const [messages, setMessages] = useState([
+        {
+            role: "assistant",
+            content: "Hello! 👋 I'm your FlightOps Agent. Ask me anything about flight operations — delays, fuel, passengers, aircraft details, etc.",
+            timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+        },
+    ]);
+    const [input, setInput] = useState("");
+    const [loading, setLoading] = useState(false);
+    const [agentState, setAgentState] = useState({
+        phase: 'idle',
+        progress: 0,
+        message: ''
+    });
+    const [tokenUsage, setTokenUsage] = useState(null);
+    const messagesEndRef = useRef(null);
+
+    const scrollToBottom = () => {
+        messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    };
+
+    useEffect(() => {
+        scrollToBottom();
+    }, [messages]);
+
+    async function sendMessage() {
+        if (!input.trim()) return;
+
+        const userMessage = { 
+            role: "user", 
+            content: input,
+            timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+        };
+        setMessages((prev) => [...prev, userMessage]);
+        setLoading(true);
+        setInput("");
+        setTokenUsage(null);
+
+        setAgentState({
+            phase: 'thinking',
+            progress: 0,
+            message: 'Starting analysis...'
+        });
+
+        const body = {
+            thread_id: "thread-" + Date.now(),
+            run_id: "run-" + Date.now(),
+            messages: [userMessage],
+        };
+
+        try {
+            const resp = await fetch(AG_AGENT_ENDPOINT, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(body),
+            });
+
+            if (!resp.ok) {
+                const errTxt = await resp.text();
+                throw new Error(errTxt);
+            }
+
+            const reader = resp.body.getReader();
+            const decoder = new TextDecoder();
+            let buf = "";
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                buf += decoder.decode(value, { stream: true });
+
+                let idx;
+                while ((idx = buf.indexOf("\n\n")) !== -1) {
+                    const chunk = buf.slice(0, idx).trim();
+                    buf = buf.slice(idx + 2);
+                    const lines = chunk.split("\n");
+
+                    for (const line of lines) {
+                        if (line.startsWith("data: ")) {
+                            const payload = line.slice(6).trim();
+                            if (!payload) continue;
+
+                            try {
+                                const event = JSON.parse(payload);
+                                handleEvent(event);
+                            } catch (err) {
+                                console.warn("Bad SSE line:", payload);
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (err) {
+            setMessages((prev) => [
+                ...prev,
+                { 
+                    role: "assistant", 
+                    content: "⚠️ Error: " + err.message,
+                    timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+                },
+            ]);
+            setAgentState({ phase: 'idle', progress: 0, message: '' });
+        } finally {
+            setLoading(false);
+        }
+    }
+
+    function handleEvent(event) {
+        const timestamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+        switch (event.type) {
+            case "STATE_UPDATE":
+                setAgentState(event.state);
+                break;
+
+            case "TEXT_MESSAGE_CONTENT":
+                if (event.message) {
+                    if (event.message.delta) {
+                        setMessages(prev => {
+                            const existingIdx = prev.findIndex(m => m.id === event.message.id);
+                            if (existingIdx >= 0) {
+                                const updated = [...prev];
+                                updated[existingIdx].content += event.message.delta;
+                                updated[existingIdx].timestamp = timestamp;
+                                return updated;
+                            } else {
+                                return [...prev, {
+                                    id: event.message.id,
+                                    role: event.message.role,
+                                    content: event.message.delta,
+                                    timestamp: timestamp
+                                }];
+                            }
+                        });
+                    } else if (event.message.content) {
+                        setMessages(prev => [...prev, {
+                            id: event.message.id,
+                            role: event.message.role,
+                            content: event.message.content,
+                            timestamp: timestamp
+                        }]);
+                    }
+                } else if (event.content) {
+                    setMessages(prev => [...prev, {
+                        role: "assistant",
+                        content: event.content,
+                        timestamp: timestamp
+                    }]);
+                }
+                break;
+
+            case "TOOL_CALL_START":
+                setMessages(prev => [...prev, {
+                    role: "system",
+                    content: `🛠️ Starting ${event.toolCallName}...`,
+                    timestamp: timestamp
+                }]);
+                break;
+
+            case "TOKEN_USAGE":
+                // event.token_usage is { planning: {...}, summarization: {...} }
+                setTokenUsage(event.token_usage || null);
+                break;
+
+            case "RUN_FINISHED":
+                setAgentState({ phase: 'idle', progress: 0, message: '' });
+                break;
+
+            case "RUN_ERROR":
+                setMessages(prev => [...prev, {
+                    role: "assistant",
+                    content: "❌ " + event.error,
+                    timestamp: timestamp
+                }]);
+                setAgentState({ phase: 'idle', progress: 0, message: '' });
+                break;
+
+            default:
+                break;
+        }
+    }
+
+    const StatusIndicator = () => {
+        if (agentState.phase === 'idle') return null;
+
+        const phaseIcons = {
+            thinking: '🧠',
+            processing: '🛠️',
+            typing: '✍️',
+            finished: '✅'
+        };
+
+        return (
+            <div className={`status-indicator ${agentState.phase}`}>
+                <div className="status-content">
+                    <div style={{display:'flex', alignItems:'center', gap:8}}>
+                        <span className="status-icon">{phaseIcons[agentState.phase]}</span>
+                        <span className="status-message">{agentState.message}</span>
+                    </div>
+                    {agentState.progress > 0 && (
+                        <div className="progress-bar" style={{marginTop:8}}>
+                            <div 
+                                className="progress-fill"
+                                style={{ width: `${agentState.progress}%` }}
+                            ></div>
+                        </div>
+                    )}
+                </div>
+            </div>
+        );
+    };
+
+    // Token usage display
+    const TokenUsageBlock = ({ usage }) => {
+        if (!usage) return null;
+        const planning = usage.planning || {};
+        const summarization = usage.summarization || {};
+        const total = usage.total || {};
+        return (
+            <div style={{padding: '8px 12px', borderTop: '1px solid #eee', fontSize: 12, color: '#374151'}}>
+                <div style={{fontWeight:600}}>LLM token usage</div>
+                <div style={{display:'flex', gap:12, marginTop:6}}>
+                    <div>Planning: {planning && planning.total_tokens ? planning.total_tokens : '-'}</div>
+                    <div>Summarization: {summarization && summarization.total_tokens ? summarization.total_tokens : '-'}</div>
+                    <div>Total: {total && total.total_tokens ? total.total_tokens : (total && total.total_tokens === 0 ? 0 : (total && (total.prompt_tokens || total.completion_tokens) ? (Number(total.prompt_tokens||0)+Number(total.completion_tokens||0)) : '-'))}</div>
+                </div>
+            </div>
+        );
+    };
+
+    return (
+        <div className="chat-container">
+            <div className="messages-container">
+                {messages.map((msg, idx) => (
+                    <MessageBubble 
+                        key={msg.id || idx} 
+                        role={msg.role} 
+                        content={msg.content} 
+                        timestamp={msg.timestamp}
+                    />
+                ))}
+
+                <StatusIndicator />
+
+                {tokenUsage && <TokenUsageBlock usage={tokenUsage} />}
+
+                {loading && agentState.phase === 'idle' && (
+                    <div className="loading-message">
+                        <div className="loading-dots">
+                            <span></span>
+                            <span></span>
+                            <span></span>
+                        </div>
+                        <div className="loading-timestamp">
+                            {new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                        </div>
+                    </div>
+                )}
+                <div ref={messagesEndRef} />
+            </div>
+
+            <div className="input-container">
+                <input
+                    type="text"
+                    className="message-input"
+                    placeholder="Ask about a flight, e.g. 'Why was 6E215 delayed on June 23, 2024?'"
+                    value={input}
+                    onChange={(e) => setInput(e.target.value)}
+                    onKeyDown={(e) => e.key === "Enter" && sendMessage()}
+                    disabled={loading}
+                />
+                <button
+                    onClick={sendMessage}
+                    className="send-button"
+                    disabled={loading}
+                >
+                    Send
+                </button>
+            </div>
+        </div>
+    );
+}
+################################################
+/* Flight Data Container */
+.flight-data-container {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  line-height: 1.55;
+  color: #111827;
+  padding: 0.2rem 0;
+}
+
+/* Section Headers */
+.flight-section-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+  padding-bottom: 0.35rem;
+  border-bottom: 1px solid #eef2f7;
+}
+.section-emoji { font-size: 1.1rem; }
+.section-title { font-weight: 700; color: #0f172a; }
+
+/* Data lines */
+.flight-data-line { display: flex; gap: 0.75rem; padding: 0.375rem 0; align-items: flex-start; }
+.flight-data-key { min-width: 140px; color: #0f172a; font-weight: 600; flex-shrink: 0; }
+.flight-data-value { color: #374151; flex: 1; }
+.flight-data-spacing { height: 0.6rem; }
+
+/* Assistant summary */
+.assistant-summary { color: #111827; line-height: 1.5; }
+.assistant-summary-title { font-weight: 700; margin-bottom: 0.5rem; color: #0b3bff; }
+.assistant-summary-section { margin-bottom: 0.75rem; }
+.assistant-summary-paragraph { color: #374151; }
+.assistant-bullets { margin: 0.25rem 0 0.5rem 1rem; color: #374151; }
+
+/* Keep message-content sizing comfortable for flight cards */
+.message-content { max-width: 78%; padding: 1rem 1.1rem; border-radius: 12px; }
+@media (max-width: 768px) { .message-content { max-width: 92%; } }
+##############################################################
+
 # server.py
 import os
 import logging
