@@ -1,3 +1,550 @@
+/* App.css - complete stylesheet for FlightOps Chat UI */
+
+/* Reset and base styles */
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  height: 100vh;
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  color: #0f172a;
+}
+
+.app-container {
+  display: flex;
+  height: 100vh;
+}
+
+/* Sidebar Styles */
+.sidebar {
+  width: 250px;
+  background: linear-gradient(180deg, #1e1b4b 0%, #312e81 100%);
+  color: white;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 4px 0 20px rgba(0, 0, 0, 0.12);
+}
+
+.sidebar-header {
+  padding: 2rem 1.5rem 1rem;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.logo-container {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+}
+
+.logo-placeholder {
+  width: 60px;
+  height: 60px;
+  background: linear-gradient(135deg, #818cf8, #4f46e5);
+  border-radius: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.5rem;
+  margin-bottom: 1rem;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
+  color: white;
+}
+
+.sidebar-header h1 {
+  font-size: 1.05rem;
+  font-weight: 600;
+  color: #e0e7ff;
+}
+
+.sidebar-content {
+  flex: 1;
+  padding: 1.5rem;
+  overflow-y: auto;
+}
+
+.sidebar-section {
+  margin-bottom: 2rem;
+}
+
+.sidebar-section h3 {
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: #a5b4fc;
+  margin-bottom: 1rem;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.sidebar-btn {
+  width: 100%;
+  padding: 0.75rem 1rem;
+  margin-bottom: 0.5rem;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  color: white;
+  cursor: pointer;
+  transition: all 0.22s ease;
+  text-align: left;
+  font-size: 0.92rem;
+}
+
+.sidebar-btn:hover {
+  background: rgba(255, 255, 255, 0.14);
+  transform: translateX(4px);
+}
+
+.recent-query {
+  padding: 0.75rem 1rem;
+  margin-bottom: 0.5rem;
+  background: rgba(255, 255, 255, 0.04);
+  border-radius: 6px;
+  font-size: 0.85rem;
+  color: #c7d2fe;
+  border-left: 3px solid #818cf8;
+}
+
+/* Indigo GIF Placeholder */
+.indigo-gif-placeholder {
+  margin-top: auto;
+  padding: 1.5rem;
+  background: rgba(255, 255, 255, 0.04);
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.gif-container {
+  text-align: center;
+}
+
+.animated-plane {
+  font-size: 3rem;
+  margin-bottom: 1rem;
+  animation: float 3s ease-in-out infinite;
+  filter: drop-shadow(0 8px 16px rgba(0,0,0,0.15));
+}
+
+@keyframes float {
+  0%, 100% { transform: translateY(0px); }
+  50%    { transform: translateY(-10px); }
+}
+
+.gif-container p {
+  color: #a5b4fc;
+  font-size: 0.9rem;
+  margin-bottom: 0.25rem;
+}
+
+/* Main Content */
+.main-content {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  background: #f8fafc;
+  overflow: hidden;
+}
+
+.header {
+  background: white;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.05);
+  padding: 0.5rem 1.5rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Scrollbar Styling */
+.sidebar-content::-webkit-scrollbar {
+  width: 6px;
+}
+
+.sidebar-content::-webkit-scrollbar-track {
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.sidebar-content::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.15);
+  border-radius: 8px;
+}
+
+/* Responsive Sidebar tweaks */
+@media (max-width: 1000px) {
+  .sidebar { width: 210px; }
+}
+@media (max-width: 768px) {
+  .app-container { flex-direction: column; }
+  .sidebar { width: 100%; height: auto; max-height: 200px; }
+  .sidebar-content { display: flex; overflow-x: auto; gap: 1rem; }
+  .indigo-gif-placeholder { display: none; }
+}
+
+/* Chat Container */
+.chat-container {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  background: white;
+  margin: 1rem;
+  border-radius: 12px;
+  box-shadow: 0 8px 30px rgba(2,6,23,0.06);
+  overflow: hidden;
+}
+
+.messages-container {
+  flex: 1;
+  padding: 1.5rem;
+  overflow-y: auto;
+  background: #f8fafc;
+}
+
+/* Message Bubbles */
+.message {
+  margin-bottom: 1.25rem;
+  display: flex;
+  width: 100%;
+}
+
+.user-message {
+  justify-content: flex-end;
+}
+
+.user-message .message-content {
+  background: linear-gradient(135deg, #667eea, #764ba2);
+  color: white;
+  border-bottom-right-radius: 6px;
+}
+
+.assistant-message .message-content {
+  background: white;
+  color: #374151;
+  border: 1px solid #e6eef6;
+  border-bottom-left-radius: 6px;
+  box-shadow: 0 4px 16px rgba(15, 23, 42, 0.04);
+}
+
+/* Generic message content sizing */
+.message-content {
+  max-width: 60%;
+  padding: 1rem 1.25rem;
+  border-radius: 18px;
+  position: relative;
+  word-break: break-word;
+  animation: slideIn 0.25s ease-out;
+}
+
+@keyframes slideIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.message-text {
+  line-height: 1.5;
+  margin-bottom: 0.5rem;
+  white-space: pre-wrap;
+}
+
+.message-timestamp {
+  font-size: 0.75rem;
+  opacity: 0.78;
+  margin-top: 0.6rem;
+}
+
+.user-message .message-timestamp {
+  text-align: right;
+  color: rgba(255, 255, 255, 0.88);
+}
+
+.assistant-message .message-timestamp {
+  text-align: left;
+  color: #6b7280;
+}
+
+/* Loading Animation */
+.loading-message {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  margin-bottom: 1.5rem;
+}
+
+.loading-dots {
+  display: flex;
+  gap: 0.25rem;
+  padding: 1rem 1.25rem;
+  background: white;
+  border-radius: 18px;
+  border: 1px solid #e6eef6;
+}
+
+.loading-dots span {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #9ca3af;
+  animation: bounce 1.4s infinite ease-in-out;
+}
+
+.loading-dots span:nth-child(1) { animation-delay: -0.32s; }
+.loading-dots span:nth-child(2) { animation-delay: -0.16s; }
+
+@keyframes bounce {
+  0%, 80%, 100% { transform: scale(0.8); opacity: 0.5; }
+  40% { transform: scale(1); opacity: 1; }
+}
+
+.loading-timestamp {
+  font-size: 0.75rem;
+  color: #6b7280;
+  margin-top: 0.5rem;
+  margin-left: 1.25rem;
+}
+
+/* Input Container */
+.input-container {
+  display: flex;
+  gap: 0.75rem;
+  padding: 1.25rem;
+  background: white;
+  border-top: 1px solid #eef2f7;
+}
+
+.message-input {
+  flex: 1;
+  padding: 0.75rem 1rem;
+  border: 1px solid #d1d5db;
+  border-radius: 12px;
+  font-size: 0.95rem;
+  outline: none;
+  transition: all 0.18s;
+  background: white;
+}
+
+.message-input:focus {
+  border-color: #4f46e5;
+  box-shadow: 0 6px 18px rgba(79,70,229,0.08);
+}
+
+.send-button {
+  padding: 0.75rem 1.5rem;
+  background: linear-gradient(135deg, #4f46e5, #7c3aed);
+  color: white;
+  border: none;
+  border-radius: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.16s;
+}
+
+.send-button:hover:not(:disabled) {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 24px rgba(79, 70, 229, 0.18);
+}
+
+.send-button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+  transform: none;
+}
+
+/* Responsive */
+@media (max-width: 768px) {
+  .message-content { max-width: 85%; padding: 0.85rem 1rem; }
+  .input-container { padding: 1rem; }
+}
+
+/* Statebar / Agent status */
+.statebar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  border-bottom: 1px solid #eef2f7;
+  background: #fff;
+}
+
+.statebar-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 160px;
+}
+
+.state-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: #10b981;
+  box-shadow: 0 0 0 2px rgba(16,185,129,0.08);
+}
+
+.state-text {
+  font-size: 0.9rem;
+  color: #374151;
+  text-transform: capitalize;
+}
+
+.statebar-progress {
+  flex: 1;
+  height: 6px;
+  background: #f3f4f6;
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+/* Small progress fill utility (used inline in components) */
+.progress-bar { width: 100%; height: 6px; background: #e5e7eb; border-radius: 3px; overflow: hidden; }
+.progress-fill { height: 100%; background: linear-gradient(90deg, #4f46e5, #7c3aed); transition: width 0.3s ease; border-radius: 3px; }
+
+/* Status indicator variants */
+.status-indicator {
+  padding: 1rem 1.25rem;
+  margin: 1rem 0;
+  border-radius: 12px;
+  background: #f8fafc;
+  border: 1px solid #eaf2ff;
+  border-left: 4px solid #4f46e5;
+}
+
+.status-indicator.thinking { border-left-color: #8b5cf6; background: #faf5ff; }
+.status-indicator.processing { border-left-color: #f59e0b; background: #fffbeb; }
+.status-indicator.typing { border-left-color: #10b981; background: #ecfdf5; }
+
+.status-content { display: flex; flex-direction: column; gap: 0.5rem; }
+.status-icon { font-size: 1.25rem; margin-right: 0.5rem; }
+.status-message { font-weight: 500; color: #374151; }
+
+/* ------------------------------------------------------------------
+   Flight data & assistant summary styles (plain text, not markdown)
+   ------------------------------------------------------------------*/
+
+/* Flight Data Container */
+.flight-data-container {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  line-height: 1.55;
+  color: #0f172a;
+  padding: 0.125rem 0;
+  word-break: break-word;
+}
+
+/* Section Headers */
+.flight-section-header {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin-top: 0.9rem;
+  padding-bottom: 0.45rem;
+  border-bottom: 1px solid #eef2f7;
+}
+
+.section-emoji {
+  font-size: 1.05rem;
+}
+
+.section-title {
+  font-weight: 700;
+  color: #0f172a;
+  font-size: 1rem;
+}
+
+/* First header spacing */
+.flight-section-header:first-child { margin-top: 0; }
+
+/* Data Lines */
+.flight-data-line {
+  display: flex;
+  gap: 0.75rem;
+  padding: 0.35rem 0;
+  align-items: flex-start;
+}
+
+.flight-data-key {
+  font-weight: 600;
+  color: #0f172a;
+  min-width: 140px;
+  flex-shrink: 0;
+}
+
+.flight-data-value {
+  color: #374151;
+  flex: 1;
+}
+
+/* Regular Text */
+.flight-data-text {
+  margin: 0.35rem 0;
+  padding: 0.25rem 0;
+  color: #374151;
+  white-space: pre-wrap;
+}
+
+/* Spacing */
+.flight-data-spacing { height: 0.6rem; }
+
+/* Performance & status classes */
+.performance-good { color: #059669; font-weight: 600; }
+.performance-average { color: #d97706; font-weight: 600; }
+.performance-poor { color: #dc2626; font-weight: 600; }
+
+.status-scheduled { color: #059669; font-weight: 600; }
+.status-delayed   { color: #dc2626; font-weight: 600; }
+.status-cancelled { color: #dc2626; font-weight: 600; }
+.status-active    { color: #2563eb; font-weight: 600; }
+
+/* Assistant summary card */
+.assistant-summary {
+  color: #0f172a;
+  line-height: 1.5;
+  padding: 0.25rem 0;
+}
+
+.assistant-summary-title {
+  font-weight: 700;
+  margin-bottom: 0.5rem;
+  color: #0b3bff;
+}
+
+.assistant-summary-section {
+  margin-bottom: 0.6rem;
+}
+
+.assistant-summary-paragraph {
+  color: #374151;
+  white-space: pre-wrap;
+}
+
+.assistant-bullets {
+  margin: 0.25rem 0 0.5rem 1rem;
+  color: #374151;
+}
+
+/* Token usage block (small inline card) */
+.token-usage-block {
+  padding: 0.6rem 0.8rem;
+  border-top: 1px solid #eef2f7;
+  font-size: 0.85rem;
+  color: #374151;
+}
+
+/* small utility tweaks */
+.small-muted { color: #6b7280; font-size: 0.82rem; }
+
+/* final responsive tweaks */
+@media (max-width: 520px) {
+  .flight-data-key { min-width: 110px; font-size: 0.9rem; }
+  .section-title { font-size: 0.95rem; }
+  .message-content { padding: 0.8rem 0.95rem; }
+  .logo-placeholder { width: 52px; height: 52px; }
+}
+###############################################
+
 # client.py
 import os
 import json
